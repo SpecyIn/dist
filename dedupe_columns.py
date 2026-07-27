@@ -4,9 +4,9 @@ Duplicate Column Resolver for Power BI PBIP / TMDL files.
 Scans files sequentially for duplicate column definitions, extracts and compares
 their lineageTag / sourceLineageTag values, computes and ANSI-color highlights exact line/property
 differences between options, queries Git history (git show HEAD) if conflict markers were
-already removed (e.g. after accepting both changes), displays whether each option originated
-from Current Branch (HEAD) or Incoming Change (branch), tracks remaining duplicate counts per-file
-and total across all files, and prompts the user to select which definition to keep (or skip).
+already removed (e.g. after accepting both changes), displays Incoming Change ALWAYS on top (Option 1)
+and Current Change (HEAD) on bottom (Option 2), tracks remaining duplicate counts per-file and total
+across all files, and prompts the user to select which definition to keep (or skip).
 """
 
 import argparse
@@ -116,6 +116,23 @@ def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]
             elif key_name == "sourcelineagetag":
                 source_lineage_tag = val
     return lineage_tag, source_lineage_tag
+
+
+def sort_blocks_incoming_first(col_blocks: List[ColumnBlock]) -> List[ColumnBlock]:
+    """
+    Ensures Incoming Change comes first (Option 1 on top) and Current Branch (HEAD) comes second (Option 2 on bottom).
+    """
+    if len(col_blocks) != 2:
+        return col_blocks
+
+    def get_sort_key(block: ColumnBlock) -> int:
+        if block.git_side == "INCOMING" or (block.git_label and "Incoming" in block.git_label):
+            return 0  # Incoming comes first (Option 1)
+        if block.git_side == "CURRENT" or (block.git_label and "Current" in block.git_label):
+            return 1  # Current comes second (Option 2)
+        return 2
+
+    return sorted(col_blocks, key=get_sort_key)
 
 
 def compute_block_differences(col_blocks: List[ColumnBlock]) -> Tuple[List[str], List[Set[int]]]:
@@ -466,21 +483,24 @@ def process_file_task(
     stats: SummaryStats
 ) -> None:
     """
-    Processes duplicate columns for a single file task, displaying highlighted diffs
-    and remaining duplicate counts per file and total across all files.
+    Processes duplicate columns for a single file task, displaying highlighted diffs,
+    ensuring Incoming Change is Option 1 (on top) and Current Change is Option 2 (on bottom),
+    and tracking remaining duplicate counts per file and total across all files.
     """
     num_dups_in_file = len(task.duplicate_groups)
     dups_remaining_in_file = num_dups_in_file
     lines_to_delete: Set[int] = set()
     file_modified = False
 
-    print(f"\n{CLR_CYAN}================================================================================{CLR_RESET}")
-    print(f"{CLR_BOLD}Processing File [{file_idx}/{total_files}]: {task.file_path}{CLR_RESET}")
+    print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
+    print(CLR_BOLD + f"Processing File [{file_idx}/{total_files}]: {task.file_path}" + CLR_RESET)
     print(f"Found {num_dups_in_file} column(s) with duplicate definitions in this file.")
-    print(f"{CLR_CYAN}================================================================================{CLR_RESET}")
+    print(CLR_CYAN + "================================================================================" + CLR_RESET)
 
     for col_idx, (col_key, col_blocks) in enumerate(task.duplicate_groups.items(), 1):
         check_git_origin_for_blocks(task.file_path, col_blocks)
+        # Always sort so Incoming Change is Option 1 (top) and Current Change (HEAD) is Option 2 (bottom)
+        col_blocks = sort_blocks_incoming_first(col_blocks)
 
         col_display_name = col_blocks[0].col_name
         stats.duplicates_found += 1
@@ -509,10 +529,10 @@ def process_file_task(
             label_str = f" ({last_blk.git_label})" if last_blk.git_label else ""
             print(f"\n[AUTO-KEEP LAST] Selected Option {num_options}{label_str} for column '{col_display_name}'")
         else:
-            print(f"\n{CLR_BOLD}Duplicate {col_idx} of {num_dups_in_file} for column: '{col_display_name}'{CLR_RESET}")
+            print("\n" + CLR_BOLD + f"Duplicate {col_idx} of {num_dups_in_file} for column: '{col_display_name}'" + CLR_RESET)
             print(f"  --> Remaining in THIS file: {dups_remaining_in_file} | TOTAL remaining across all files: {global_remaining[0]}")
             
-            print(f"\n{CLR_CYAN}  • LineageTag Comparison Summary:{CLR_RESET}")
+            print("\n" + CLR_CYAN + "  • LineageTag Comparison Summary:" + CLR_RESET)
             for idx, blk in enumerate(col_blocks, 1):
                 lt, slt = extract_lineage_tags(blk.lines)
                 if lt:
@@ -526,7 +546,7 @@ def process_file_task(
                 print(f"      Option [{idx}]: {tag_desc}{origin_desc} (Line {blk.start_line + 1})")
 
             if diff_summary:
-                print(f"\n{CLR_CYAN}  • Key Differences Highlight:{CLR_RESET}")
+                print("\n" + CLR_CYAN + "  • Key Differences Highlight:" + CLR_RESET)
                 for d_line in diff_summary:
                     print(d_line)
 
@@ -535,7 +555,7 @@ def process_file_task(
                 diff_set = diff_indices[idx - 1] if idx - 1 < len(diff_indices) else set()
                 formatted_body = format_block_with_diff_highlights(blk, diff_set)
 
-                print(f"\n{CLR_BOLD}--- Option [{idx}]{origin} (Lines {blk.start_line + 1}-{blk.end_line}) ---{CLR_RESET}")
+                print("\n" + CLR_BOLD + f"--- Option [{idx}]{origin} (Lines {blk.start_line + 1}-{blk.end_line}) ---" + CLR_RESET)
                 print(formatted_body)
 
             print("-" * 60)
@@ -609,12 +629,12 @@ def main() -> None:
     parser.add_argument(
         "--keep-first",
         action="store_true",
-        help="Automatically keep the first occurrence / Current Change without prompting.",
+        help="Automatically keep the first occurrence / Incoming Change without prompting.",
     )
     parser.add_argument(
         "--keep-last",
         action="store_true",
-        help="Automatically keep the last occurrence / Incoming Change without prompting.",
+        help="Automatically keep the last occurrence / Current Change without prompting.",
     )
 
     args = parser.parse_args()
