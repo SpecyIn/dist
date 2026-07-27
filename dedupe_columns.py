@@ -2,14 +2,16 @@
 """
 Duplicate Column Resolver for Power BI PBIP / TMDL files.
 Scans files sequentially for duplicate column definitions, extracts and compares
-their lineageTag / sourceLineageTag values, displays whether each option originated
-from Current Change (HEAD) or Incoming Change (branch), and prompts the user to select
-which definition to keep (or skip).
+their lineageTag / sourceLineageTag values, queries Git history (git show HEAD) if
+conflict markers were already removed (e.g. after accepting both changes), displays whether
+each option originated from Current Branch (HEAD) or Incoming Change (branch), and prompts
+the user to select which definition to keep (or skip).
 """
 
 import argparse
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +25,7 @@ class ColumnBlock:
     end_line: int    # 0-indexed line number exclusive
     lines: List[str]
     git_side: Optional[str] = None            # "CURRENT" or "INCOMING"
-    git_label: Optional[str] = None           # e.g. "Current Change (HEAD)" or "Incoming Change (feature/branch)"
+    git_label: Optional[str] = None           # e.g. "Current Branch (HEAD)" or "Incoming Change (feature/branch)"
     conflict_start_line: Optional[int] = None # Line index of <<<<<<< if inside Git conflict
     conflict_sep_line: Optional[int] = None   # Line index of ======= if inside Git conflict
     conflict_end_line: Optional[int] = None   # Line index of >>>>>>> if inside Git conflict
@@ -46,9 +48,15 @@ class SummaryStats:
 # Regex to detect TMDL column header line (e.g. "column SPECIAL_SENSITIVE_SEC" or "column 'Special Column'")
 COLUMN_HEADER_PATTERN = re.compile(r'^(?P<indent>\s*)column\s+(?P<header>.+)$', re.IGNORECASE)
 
-# Regex to match lineageTag or sourceLineageTag property lines
+# Keywords that start a new object in TMDL at the same or lower indentation level
+OBJECT_KEYWORDS = re.compile(
+    r'^\s*(?:column|measure|partition|table|hierarchy|ref|role|expression|perspective|culture)\b',
+    re.IGNORECASE
+)
+
+# Regex to match lineageTag or sourceLineageTag property lines with optional quotes
 TAG_PATTERN = re.compile(
-    r'^\s*(?:"?(lineageTag|sourceLineageTag)"?)\s*:\s*(.+)$',
+    r'^\s*["\']?(lineageTag|sourceLineageTag)["\']?\s*:\s*(.+)$',
     re.IGNORECASE
 )
 
@@ -73,7 +81,7 @@ def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]
     lineage_tag = None
     source_lineage_tag = None
     for line in lines:
-        match = TAG_PATTERN.match(line.strip())
+        match = TAG_PATTERN.match(line)
         if match:
             key_name = match.group(1).lower()
             val = match.group(2).strip()
@@ -82,6 +90,83 @@ def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]
             elif key_name == "sourcelineagetag":
                 source_lineage_tag = val
     return lineage_tag, source_lineage_tag
+
+
+def get_git_head_content(file_path: Path) -> Optional[str]:
+    """
+    Attempts to retrieve the content of file_path from Git HEAD (or ORIG_HEAD)
+    using git CLI commands.
+    """
+    try:
+        # Get repository root directory
+        repo_root_cmd = ["git", "rev-parse", "--show-toplevel"]
+        res = subprocess.run(
+            repo_root_cmd,
+            cwd=file_path.parent if file_path.is_file() else file_path,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if res.returncode != 0:
+            return None
+        repo_root = Path(res.stdout.strip())
+
+        rel_path = file_path.resolve().relative_to(repo_root.resolve()).as_posix()
+
+        for ref in ("HEAD", "ORIG_HEAD", "MERGE_HEAD"):
+            git_show_cmd = ["git", "show", f"{ref}:{rel_path}"]
+            res_show = subprocess.run(
+                git_show_cmd,
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if res_show.returncode == 0 and res_show.stdout:
+                return res_show.stdout
+    except Exception:
+        pass
+    return None
+
+
+def check_git_origin_for_blocks(
+    file_path: Path, col_blocks: List[ColumnBlock]
+) -> None:
+    """
+    If blocks do not already have git_label (i.e. conflict markers were removed),
+    queries Git HEAD for the file's previous version to identify which block came from HEAD.
+    """
+    if any(blk.git_label is not None for blk in col_blocks):
+        return
+
+    head_content = get_git_head_content(file_path)
+    if not head_content:
+        return
+
+    head_lines = head_content.splitlines(keepends=True)
+    head_blocks = extract_column_blocks(head_lines)
+
+    col_name_key = col_blocks[0].col_name.lower()
+    head_cols = [b for b in head_blocks if b.col_name.lower() == col_name_key]
+    if not head_cols:
+        return
+
+    head_lt, head_slt = extract_lineage_tags(head_cols[0].lines)
+
+    matched_head = False
+    for blk in col_blocks:
+        lt, slt = extract_lineage_tags(blk.lines)
+        if (head_lt and lt == head_lt) or (head_slt and slt == head_slt):
+            blk.git_label = "Current Branch (HEAD)"
+            matched_head = True
+        elif head_lt is None and head_slt is None and "".join(blk.lines).strip() == "".join(head_cols[0].lines).strip():
+            blk.git_label = "Current Branch (HEAD)"
+            matched_head = True
+
+    if matched_head:
+        for blk in col_blocks:
+            if blk.git_label is None:
+                blk.git_label = "Incoming Change (feature branch)"
 
 
 def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
@@ -110,7 +195,7 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
             in_conflict = True
             current_side = "CURRENT"
             ref = stripped[7:].strip()
-            current_label = f"Current Change ({ref if ref else 'HEAD'})"
+            current_label = f"Current Branch ({ref if ref else 'HEAD'})"
             conflict_start_idx = i
             conflict_sep_idx = None
             conflict_end_idx = None
@@ -180,6 +265,10 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
 
                     if curr_indent > header_indent:
                         j += 1
+                    elif curr_indent == header_indent:
+                        if OBJECT_KEYWORDS.match(curr_line):
+                            break
+                        j += 1
                     else:
                         break
 
@@ -240,6 +329,9 @@ def resolve_file_duplicates(
     print(f"================================================================================")
 
     for col_key, col_blocks in duplicate_groups.items():
+        # Check Git history to label HEAD vs Incoming if conflict markers were already removed
+        check_git_origin_for_blocks(file_path, col_blocks)
+
         col_display_name = col_blocks[0].col_name
         stats.duplicates_found += 1
         num_options = len(col_blocks)
@@ -275,9 +367,9 @@ def resolve_file_duplicates(
                 elif slt:
                     tag_desc = f"sourceLineageTag: {slt}"
                 else:
-                    tag_desc = "lineageTag: (none)"
+                    tag_desc = "lineageTag: (none found)"
 
-                origin_desc = f"  [{blk.git_label}]" if blk.git_label else ""
+                origin_desc = f"  [{blk.git_label}]" if blk.git_label else f"  [Occurrence {idx}]"
                 print(f"      Option [{idx}]: {tag_desc}{origin_desc} (Line {blk.start_line + 1})")
 
             for idx, blk in enumerate(col_blocks, 1):
@@ -450,10 +542,7 @@ def main() -> None:
     stats = SummaryStats()
 
     if target_path.is_file():
-        if should_process_file(target_path, extensions_set):
-            process_file(target_path, args.dry_run, auto_keep, stats)
-        else:
-            print(f"Skipped (extension mismatch): {target_path}")
+        process_file(target_path, args.dry_run, auto_keep, stats)
     elif target_path.is_dir():
         for root, _, files in os.walk(target_path):
             for file in files:
@@ -479,6 +568,6 @@ if __name__ == "__main__":
 
 # Example usage:
 # python dedupe_columns.py
+# python dedupe_columns.py "C:/path/to/file.tmdl"
 # python dedupe_columns.py "C:/path/to/folder"
 # python dedupe_columns.py "C:/path/to/folder" --dry-run
-# python dedupe_columns.py "C:/path/to/folder" --extensions tmdl,json
