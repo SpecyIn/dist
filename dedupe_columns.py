@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Duplicate Column Resolver for Power BI PBIP / TMDL files.
-Scans files sequentially for duplicate column definitions, extracts and compares
-their lineageTag / sourceLineageTag values, computes and ANSI-color highlights exact line/property
-differences between options, queries Git history (git show HEAD) if conflict markers were
-already removed (e.g. after accepting both changes), GUARANTEES Incoming Change is ALWAYS Option 1 (on top)
-and Current Change (HEAD) is ALWAYS Option 2 (on bottom), tracks remaining duplicate counts per-file and total
-across all files, and prompts the user to select which definition to keep (or skip).
+Duplicate Object Resolver for Power BI PBIP / TMDL files.
+Scans files sequentially for duplicate column and/or expression definitions,
+extracts and compares their lineageTag / sourceLineageTag values and properties,
+computes and ANSI-color highlights exact line/property differences between options,
+queries Git history (git show HEAD) if conflict markers were already removed (e.g. after accepting both changes),
+displays Incoming Change ALWAYS on top (Option 1) and Current Change (HEAD) on bottom (Option 2),
+tracks remaining duplicate counts per-file and total across all files, and prompts the user to select
+which definition to keep (or skip).
 """
 
 import argparse
@@ -38,7 +39,8 @@ CLR_BG_YELLOW = "\033[43;30m"
 
 @dataclass
 class ColumnBlock:
-    col_name: str
+    obj_type: str    # "column", "expression", "measure"
+    col_name: str    # object name
     start_line: int  # 0-indexed line number inclusive
     end_line: int    # 0-indexed line number exclusive
     lines: List[str]
@@ -58,7 +60,7 @@ class FileTask:
     file_path: Path
     has_bom: bool
     lines: List[str]
-    duplicate_groups: Dict[str, List[ColumnBlock]]
+    duplicate_groups: Dict[Tuple[str, str], List[ColumnBlock]]
 
 
 @dataclass
@@ -71,12 +73,15 @@ class SummaryStats:
     files_skipped: int = 0
 
 
-# Regex to detect TMDL column header line (e.g. "column SPECIAL_SENSITIVE_SEC" or "column 'Special Column'")
-COLUMN_HEADER_PATTERN = re.compile(r'^(?P<indent>\s*)column\s+(?P<header>.+)$', re.IGNORECASE)
+# Regex to detect TMDL column, expression, or measure header line
+OBJECT_HEADER_PATTERN = re.compile(
+    r'^(?P<indent>\s*)(?P<type>column|expression|measure)\s+(?P<header>.+)$',
+    re.IGNORECASE
+)
 
 # Keywords that start a new object in TMDL at the same or lower indentation level
 OBJECT_KEYWORDS = re.compile(
-    r'^\s*(?:column|measure|partition|table|hierarchy|ref|role|expression|perspective|culture)\b',
+    r'^\s*(?:column|expression|measure|partition|table|hierarchy|ref|role|expression|perspective|culture)\b',
     re.IGNORECASE
 )
 
@@ -93,7 +98,7 @@ def get_indent_level(indent_str: str) -> int:
 
 
 def extract_column_name(header_str: str) -> str:
-    """Extracts column name from TMDL header string, removing expression parts and quotes."""
+    """Extracts object name from TMDL header string, removing expression parts and quotes."""
     name_part = header_str.split("=")[0].strip()
     if len(name_part) >= 2 and name_part[0] in ("'", '"', '`') and name_part[0] == name_part[-1]:
         return name_part[1:-1]
@@ -102,7 +107,7 @@ def extract_column_name(header_str: str) -> str:
 
 def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Extracts (lineageTag_value, sourceLineageTag_value) from lines of a column block.
+    Extracts (lineageTag_value, sourceLineageTag_value) from lines of a block.
     """
     lineage_tag = None
     source_lineage_tag = None
@@ -137,7 +142,7 @@ def sort_blocks_incoming_first(col_blocks: List[ColumnBlock]) -> List[ColumnBloc
 
 def compute_block_differences(col_blocks: List[ColumnBlock]) -> Tuple[List[str], List[Set[int]]]:
     """
-    Computes exact property and line differences between duplicate column blocks.
+    Computes exact property and line differences between duplicate object blocks.
     Returns:
       diff_summary: list of formatted strings describing property diffs in color.
       differing_lines_per_block: list of sets containing line indices within each block that differ.
@@ -170,7 +175,6 @@ def compute_block_differences(col_blocks: List[ColumnBlock]) -> Tuple[List[str],
                         f"{CLR_GREEN}      + Option [2]: {lines2_clean[b_idx]}{CLR_RESET}"
                     )
 
-        # Mark line-by-line differences in original unstripped lines
         orig_lines1 = [l.rstrip("\r\n") for l in col_blocks[0].lines]
         orig_lines2 = [l.rstrip("\r\n") for l in col_blocks[1].lines]
         orig_matcher = difflib.SequenceMatcher(None, [l.strip() for l in orig_lines1], [l.strip() for l in orig_lines2])
@@ -186,7 +190,7 @@ def compute_block_differences(col_blocks: List[ColumnBlock]) -> Tuple[List[str],
 
 def format_block_with_diff_highlights(block: ColumnBlock, diff_indices: Set[int]) -> str:
     """
-    Formats the lines of a column block, highlighting differing lines with ANSI color, '*' indicator, and tag.
+    Formats the lines of an object block, highlighting differing lines with ANSI color, '*' indicator, and tag.
     """
     formatted_lines = []
     for idx, line in enumerate(block.lines):
@@ -220,7 +224,6 @@ def get_git_head_content(file_path: Path) -> Optional[str]:
         abs_path_str = str(abs_path)
         repo_root_str = str(repo_root)
 
-        # Normalize Windows drive letter casing (e.g. c: vs C:)
         if len(abs_path_str) >= 2 and abs_path_str[1] == ":":
             abs_path_str = abs_path_str[0].upper() + abs_path_str[1:]
         if len(repo_root_str) >= 2 and repo_root_str[1] == ":":
@@ -267,12 +270,17 @@ def check_git_origin_for_blocks(
     head_lines = head_content.splitlines(keepends=True)
     head_blocks = extract_column_blocks(head_lines)
 
-    col_name_key = col_blocks[0].col_name.lower()
-    head_cols = [b for b in head_blocks if b.col_name.lower() == col_name_key]
-    if not head_cols:
+    target_type = col_blocks[0].obj_type.lower()
+    target_name = col_blocks[0].col_name.lower()
+
+    head_matches = [
+        b for b in head_blocks
+        if b.obj_type.lower() == target_type and b.col_name.lower() == target_name
+    ]
+    if not head_matches:
         return
 
-    head_lt, head_slt = extract_lineage_tags(head_cols[0].lines)
+    head_lt, head_slt = extract_lineage_tags(head_matches[0].lines)
 
     matched_head = False
     for blk in col_blocks:
@@ -281,7 +289,7 @@ def check_git_origin_for_blocks(
             blk.git_side = "CURRENT"
             blk.git_label = "Current Branch (HEAD)"
             matched_head = True
-        elif head_lt is None and head_slt is None and "".join(blk.lines).strip() == "".join(head_cols[0].lines).strip():
+        elif head_lt is None and head_slt is None and "".join(blk.lines).strip() == "".join(head_matches[0].lines).strip():
             blk.git_side = "CURRENT"
             blk.git_label = "Current Branch (HEAD)"
             matched_head = True
@@ -295,7 +303,7 @@ def check_git_origin_for_blocks(
 
 def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
     """
-    Parses TMDL file lines and extracts all column definition blocks,
+    Parses TMDL file lines and extracts all column, expression, and measure blocks,
     tracking whether each block is inside a Git merge conflict (HEAD vs incoming branch).
     """
     blocks: List[ColumnBlock] = []
@@ -349,9 +357,10 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
             i += 1
             continue
 
-        match = COLUMN_HEADER_PATTERN.match(line)
+        match = OBJECT_HEADER_PATTERN.match(line)
         if match:
             indent_str = match.group("indent")
+            obj_type = match.group("type").lower()
             header_str = match.group("header")
 
             col_name = extract_column_name(header_str)
@@ -397,6 +406,7 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
 
             block_lines = lines[start_idx:j]
             block = ColumnBlock(
+                obj_type=obj_type,
                 col_name=col_name,
                 start_line=start_idx,
                 end_line=j,
@@ -416,11 +426,17 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
     return blocks
 
 
-def group_duplicate_columns(blocks: List[ColumnBlock]) -> Dict[str, List[ColumnBlock]]:
-    """Groups column blocks by case-insensitive column name."""
-    grouped: Dict[str, List[ColumnBlock]] = {}
+def group_duplicate_columns(
+    blocks: List[ColumnBlock], target_object_type: str = "all"
+) -> Dict[Tuple[str, str], List[ColumnBlock]]:
+    """
+    Groups object blocks by (obj_type, obj_name.lower()) and filters by target_object_type.
+    """
+    grouped: Dict[Tuple[str, str], List[ColumnBlock]] = {}
     for block in blocks:
-        key = block.col_name.lower()
+        if target_object_type != "all" and block.obj_type.lower() != target_object_type.lower():
+            continue
+        key = (block.obj_type.lower(), block.col_name.lower())
         grouped.setdefault(key, []).append(block)
 
     return {k: v for k, v in grouped.items() if len(v) > 1}
@@ -442,12 +458,41 @@ def should_process_file(file_path: Path, extensions: Optional[Set[str]]) -> bool
     return ext in extensions
 
 
+def get_target_object_type(args_type: Optional[str]) -> str:
+    """
+    Returns normalized target object type: 'column', 'expression', or 'all'.
+    Prompts interactively if not provided as a CLI flag.
+    """
+    if args_type:
+        val = args_type.strip().lower()
+        if val in ("1", "column", "columns"):
+            return "column"
+        elif val in ("2", "expression", "expressions"):
+            return "expression"
+        elif val in ("3", "all", "both"):
+            return "all"
+
+    print("\nSelect target object type to process:")
+    print(" 1 - Columns")
+    print(" 2 - Expressions")
+    print(" 3 - All (Columns & Expressions)")
+    while True:
+        choice = input("Enter option (1, 2, or 3): ").strip()
+        if choice == "1":
+            return "column"
+        elif choice == "2":
+            return "expression"
+        elif choice == "3":
+            return "all"
+        print("Invalid input. Please enter 1, 2, or 3.\n")
+
+
 def scan_and_prepare_tasks(
-    target_files: List[Path], stats: SummaryStats
+    target_files: List[Path], target_object_type: str, stats: SummaryStats
 ) -> Tuple[List[FileTask], int]:
     """
     Pre-scans all target files to filter binary/non-UTF8 files and collect
-    files containing duplicate columns along with total duplicate count.
+    files containing duplicate objects matching target_object_type along with total duplicate count.
     """
     tasks: List[FileTask] = []
     total_duplicates_all = 0
@@ -478,7 +523,7 @@ def scan_and_prepare_tasks(
         stats.files_scanned += 1
         lines = content.splitlines(keepends=True)
         blocks = extract_column_blocks(lines)
-        duplicate_groups = group_duplicate_columns(blocks)
+        duplicate_groups = group_duplicate_columns(blocks, target_object_type)
 
         if duplicate_groups:
             tasks.append(FileTask(
@@ -502,7 +547,7 @@ def process_file_task(
     stats: SummaryStats
 ) -> None:
     """
-    Processes duplicate columns for a single file task, displaying highlighted diffs,
+    Processes duplicate objects for a single file task, displaying highlighted diffs,
     ensuring Incoming Change is Option 1 (on top) and Current Change is Option 2 (on bottom),
     and tracking remaining duplicate counts per file and total across all files.
     """
@@ -513,12 +558,11 @@ def process_file_task(
 
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"Processing File [{file_idx}/{total_files}]: {task.file_path}" + CLR_RESET)
-    print(f"Found {num_dups_in_file} column(s) with duplicate definitions in this file.")
+    print(f"Found {num_dups_in_file} object(s) with duplicate definitions in this file.")
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
 
-    for col_idx, (col_key, col_blocks) in enumerate(task.duplicate_groups.items(), 1):
+    for col_idx, ((obj_type, _), col_blocks) in enumerate(task.duplicate_groups.items(), 1):
         check_git_origin_for_blocks(task.file_path, col_blocks)
-        # Always sort so Incoming Change is Option 1 (top) and Current Change (HEAD) is Option 2 (bottom)
         col_blocks = sort_blocks_incoming_first(col_blocks)
 
         col_display_name = col_blocks[0].col_name
@@ -528,7 +572,7 @@ def process_file_task(
         diff_summary, diff_indices = compute_block_differences(col_blocks)
 
         if dry_run:
-            print(f"\n[DRY-RUN] Column {col_idx}/{num_dups_in_file} ('{col_display_name}') - {num_options} duplicate definitions:")
+            print(f"\n[DRY-RUN] {obj_type.capitalize()} {col_idx}/{num_dups_in_file} ('{col_display_name}') - {num_options} duplicate definitions:")
             for idx, blk in enumerate(col_blocks, 1):
                 lt, slt = extract_lineage_tags(blk.lines)
                 tag_info = f" | lineageTag: {lt}" if lt else f" | sourceLineageTag: {slt}" if slt else ""
@@ -541,14 +585,14 @@ def process_file_task(
         if auto_keep == "first":
             selected_idx = 0
             label_str = f" ({col_blocks[0].git_label})" if col_blocks[0].git_label else ""
-            print(f"\n[AUTO-KEEP FIRST] Selected Option 1{label_str} for column '{col_display_name}'")
+            print(f"\n[AUTO-KEEP FIRST] Selected Option 1{label_str} for {obj_type} '{col_display_name}'")
         elif auto_keep == "last":
             selected_idx = num_options - 1
             last_blk = col_blocks[-1]
             label_str = f" ({last_blk.git_label})" if last_blk.git_label else ""
-            print(f"\n[AUTO-KEEP LAST] Selected Option {num_options}{label_str} for column '{col_display_name}'")
+            print(f"\n[AUTO-KEEP LAST] Selected Option {num_options}{label_str} for {obj_type} '{col_display_name}'")
         else:
-            print("\n" + CLR_BOLD + f"Duplicate {col_idx} of {num_dups_in_file} for column: '{col_display_name}'" + CLR_RESET)
+            print("\n" + CLR_BOLD + f"Duplicate {col_idx} of {num_dups_in_file} for {obj_type}: '{col_display_name}'" + CLR_RESET)
             print(f"  --> Remaining in THIS file: {dups_remaining_in_file} | TOTAL remaining across all files: {global_remaining[0]}")
             
             print("\n" + CLR_CYAN + "  • LineageTag Comparison Summary:" + CLR_RESET)
@@ -580,11 +624,11 @@ def process_file_task(
             print("-" * 60)
             while True:
                 choice = input(
-                    f"Select option to KEEP for '{col_display_name}' (1-{num_options}, or 's' to skip): "
+                    f"Select option to KEEP for {obj_type} '{col_display_name}' (1-{num_options}, or 's' to skip): "
                 ).strip().lower()
 
                 if choice in ("s", "skip"):
-                    print(f"Skipped duplicate column '{col_display_name}'.")
+                    print(f"Skipped duplicate {obj_type} '{col_display_name}'.")
                     stats.duplicates_skipped += 1
                     break
                 elif choice.isdigit():
@@ -627,7 +671,7 @@ def process_file_task(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Resolve duplicate column definitions in Power BI PBIP / TMDL files."
+        description="Resolve duplicate column and/or expression definitions in Power BI PBIP / TMDL files."
     )
     parser.add_argument(
         "path",
@@ -635,9 +679,14 @@ def main() -> None:
         help="Path to target file or folder.",
     )
     parser.add_argument(
+        "--type",
+        choices=["1", "2", "3", "column", "expression", "all"],
+        help="Target object type: 1/column, 2/expression, or 3/all.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Report duplicate columns without modifying files or prompting.",
+        help="Report duplicate objects without modifying files or prompting.",
     )
     parser.add_argument(
         "--extensions",
@@ -672,6 +721,8 @@ def main() -> None:
         print(f"Error: Path '{path_str}' does not exist.", file=sys.stderr)
         sys.exit(1)
 
+    target_object_type = get_target_object_type(args.type)
+
     ext_arg = None if args.extensions and args.extensions.lower() == "all" else args.extensions
     extensions_set = parse_extensions(ext_arg)
 
@@ -696,7 +747,7 @@ def main() -> None:
         print(f"Error: Path '{target_path}' is neither a file nor a directory.", file=sys.stderr)
         sys.exit(1)
 
-    tasks, total_duplicates_all = scan_and_prepare_tasks(target_files, stats)
+    tasks, total_duplicates_all = scan_and_prepare_tasks(target_files, target_object_type, stats)
     global_remaining = [total_duplicates_all]
     total_files = len(tasks)
 
@@ -708,9 +759,9 @@ def main() -> None:
     print("\n--- Summary ---")
     print(f"Files scanned: {stats.files_scanned}")
     print(f"Files modified: {stats.files_modified}")
-    print(f"Duplicate column groups found: {stats.duplicates_found}")
-    print(f"Duplicate column groups resolved: {stats.duplicates_resolved}")
-    print(f"Duplicate column groups skipped: {stats.duplicates_skipped}")
+    print(f"Duplicate object groups found: {stats.duplicates_found}")
+    print(f"Duplicate object groups resolved: {stats.duplicates_resolved}")
+    print(f"Duplicate object groups skipped: {stats.duplicates_skipped}")
     print(f"Files skipped (binary/non-utf8): {stats.files_skipped}")
 
 
@@ -720,6 +771,6 @@ if __name__ == "__main__":
 
 # Example usage:
 # python dedupe_columns.py
-# python dedupe_columns.py "C:/path/to/file.tmdl"
-# python dedupe_columns.py "C:/path/to/folder"
-# python dedupe_columns.py "C:/path/to/folder" --dry-run
+# python dedupe_columns.py "C:/path/to/folder" --type column
+# python dedupe_columns.py "C:/path/to/folder" --type expression
+# python dedupe_columns.py "C:/path/to/folder" --type all
