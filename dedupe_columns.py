@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Duplicate Column Resolver for Power BI PBIP / TMDL files.
-Scans files sequentially for duplicate column definitions, displays the options,
-and prompts the user to select which definition to keep.
+Scans files sequentially for duplicate column definitions, identifies whether each
+definition originated from Current Change (HEAD) or Incoming Change (branch),
+displays the options, and prompts the user to select which definition to keep.
 """
 
 import argparse
@@ -20,6 +21,11 @@ class ColumnBlock:
     start_line: int  # 0-indexed line number inclusive
     end_line: int    # 0-indexed line number exclusive
     lines: List[str]
+    git_side: Optional[str] = None            # "CURRENT" or "INCOMING"
+    git_label: Optional[str] = None           # e.g. "Current Change (HEAD)" or "Incoming Change (feature/branch)"
+    conflict_start_line: Optional[int] = None # Line index of <<<<<<< if inside Git conflict
+    conflict_sep_line: Optional[int] = None   # Line index of ======= if inside Git conflict
+    conflict_end_line: Optional[int] = None   # Line index of >>>>>>> if inside Git conflict
 
     @property
     def display_text(self) -> str:
@@ -47,9 +53,7 @@ def get_indent_level(indent_str: str) -> int:
 
 def extract_column_name(header_str: str) -> str:
     """Extracts column name from TMDL header string, removing expression parts and quotes."""
-    # If header contains '=', column name is before '='
     name_part = header_str.split("=")[0].strip()
-    # Strip surrounding quotes ('...', "...", `...`) if present
     if len(name_part) >= 2 and name_part[0] in ("'", '"', '`') and name_part[0] == name_part[-1]:
         return name_part[1:-1]
     return name_part
@@ -57,14 +61,62 @@ def extract_column_name(header_str: str) -> str:
 
 def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
     """
-    Parses TMDL file lines and extracts all column definition blocks.
+    Parses TMDL file lines and extracts all column definition blocks,
+    tracking whether each block is inside a Git merge conflict (HEAD vs incoming branch).
     """
     blocks: List[ColumnBlock] = []
     i = 0
     n = len(lines)
 
+    in_conflict = False
+    current_side: Optional[str] = None
+    current_label: Optional[str] = None
+    conflict_start_idx: Optional[int] = None
+    conflict_sep_idx: Optional[int] = None
+    conflict_end_idx: Optional[int] = None
+    active_conflict_blocks: List[ColumnBlock] = []
+
     while i < n:
         line = lines[i]
+        stripped = line.strip()
+
+        # Check for Git conflict markers
+        if stripped.startswith("<<<<<<<"):
+            in_conflict = True
+            current_side = "CURRENT"
+            ref = stripped[7:].strip()
+            current_label = f"Current Change ({ref if ref else 'HEAD'})"
+            conflict_start_idx = i
+            conflict_sep_idx = None
+            conflict_end_idx = None
+            active_conflict_blocks = []
+            i += 1
+            continue
+        elif stripped.startswith("=======") and in_conflict:
+            current_side = "INCOMING"
+            conflict_sep_idx = i
+            current_label = "Incoming Change"
+            i += 1
+            continue
+        elif stripped.startswith(">>>>>>>") and in_conflict:
+            ref = stripped[7:].strip()
+            inc_label = f"Incoming Change ({ref if ref else 'incoming'})"
+            conflict_end_idx = i
+            # Update labels and markers for blocks in this conflict region
+            for blk in active_conflict_blocks:
+                if blk.git_side == "INCOMING":
+                    blk.git_label = inc_label
+                blk.conflict_start_line = conflict_start_idx
+                blk.conflict_sep_line = conflict_sep_idx
+                blk.conflict_end_line = conflict_end_idx
+
+            in_conflict = False
+            current_side = None
+            current_label = None
+            active_conflict_blocks = []
+            i += 1
+            continue
+
         match = COLUMN_HEADER_PATTERN.match(line)
         if match:
             indent_str = match.group("indent")
@@ -77,21 +129,27 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
 
             while j < n:
                 curr_line = lines[j]
-                stripped = curr_line.strip()
+                curr_stripped = curr_line.strip()
 
-                if not stripped:
+                # Stop if we hit a conflict marker while parsing block
+                if curr_stripped.startswith("=======") or curr_stripped.startswith(">>>>>>>") or curr_stripped.startswith("<<<<<<<"):
+                    break
+
+                if not curr_stripped:
                     # Look ahead to next non-blank line
                     k = j + 1
                     next_indent = None
                     while k < n:
-                        if lines[k].strip():
+                        k_stripped = lines[k].strip()
+                        if k_stripped.startswith("=======") or k_stripped.startswith(">>>>>>>") or k_stripped.startswith("<<<<<<<"):
+                            break
+                        if k_stripped:
                             m = re.match(r"^\s*", lines[k])
                             next_indent = get_indent_level(m.group(0)) if m else 0
                             break
                         k += 1
 
                     if next_indent is not None and next_indent <= header_indent:
-                        # Reached end of block before blank line
                         break
                     j += 1
                 else:
@@ -101,16 +159,22 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
                     if curr_indent > header_indent:
                         j += 1
                     else:
-                        # Reached line at same or lower indentation level
                         break
 
             block_lines = lines[start_idx:j]
-            blocks.append(ColumnBlock(
+            block = ColumnBlock(
                 col_name=col_name,
                 start_line=start_idx,
                 end_line=j,
-                lines=block_lines
-            ))
+                lines=block_lines,
+                git_side=current_side,
+                git_label=current_label,
+            )
+
+            if in_conflict:
+                active_conflict_blocks.append(block)
+
+            blocks.append(block)
             i = j
         else:
             i += 1
@@ -137,6 +201,7 @@ def resolve_file_duplicates(
 ) -> Tuple[List[str], bool]:
     """
     Checks a single file for duplicate column blocks and resolves them interactively or automatically.
+    Displays whether each option came from Current Change (HEAD) or Incoming Change (branch).
     """
     blocks = extract_column_blocks(lines)
     duplicate_groups = group_duplicate_columns(blocks)
@@ -158,23 +223,28 @@ def resolve_file_duplicates(
         num_options = len(col_blocks)
 
         if dry_run:
-            print(f"\n[DRY-RUN] Column '{col_display_name}' has {num_options} duplicate definitions.")
+            print(f"\n[DRY-RUN] Column '{col_display_name}' has {num_options} duplicate definitions:")
             for idx, blk in enumerate(col_blocks, 1):
-                print(f"  Option [{idx}]: lines {blk.start_line + 1}-{blk.end_line}")
+                label_info = f" [{blk.git_label}]" if blk.git_label else f" [Occurrence {idx}]"
+                print(f"  Option [{idx}]{label_info}: lines {blk.start_line + 1}-{blk.end_line}")
             continue
 
         selected_idx: Optional[int] = None
 
         if auto_keep == "first":
             selected_idx = 0
-            print(f"\n[AUTO-KEEP FIRST] Selected Option 1 for column '{col_display_name}'")
+            label_str = f" ({col_blocks[0].git_label})" if col_blocks[0].git_label else ""
+            print(f"\n[AUTO-KEEP FIRST] Selected Option 1{label_str} for column '{col_display_name}'")
         elif auto_keep == "last":
             selected_idx = num_options - 1
-            print(f"\n[AUTO-KEEP LAST] Selected Option {num_options} for column '{col_display_name}'")
+            last_blk = col_blocks[-1]
+            label_str = f" ({last_blk.git_label})" if last_blk.git_label else ""
+            print(f"\n[AUTO-KEEP LAST] Selected Option {num_options}{label_str} for column '{col_display_name}'")
         else:
             print(f"\nDuplicate definitions for column: '{col_display_name}'")
             for idx, blk in enumerate(col_blocks, 1):
-                print(f"\n--- Option [{idx}] ---")
+                origin = f" [{blk.git_label}]" if blk.git_label else f" [{idx}st Occurrence]" if idx == 1 else f" [{idx}nd Occurrence]" if idx == 2 else f" [{idx}th Occurrence]"
+                print(f"\n--- Option [{idx}]{origin} (Lines {blk.start_line + 1}-{blk.end_line}) ---")
                 print(blk.display_text)
 
             print("-" * 60)
@@ -199,8 +269,18 @@ def resolve_file_duplicates(
             file_modified = True
             for idx, blk in enumerate(col_blocks):
                 if idx != selected_idx:
+                    # Delete non-selected column block lines
                     for line_no in range(blk.start_line, blk.end_line):
                         lines_to_delete.add(line_no)
+
+            # If inside Git conflict block, clean up Git conflict marker lines (<<<<<<<, =======, >>>>>>>)
+            for blk in col_blocks:
+                if blk.conflict_start_line is not None:
+                    lines_to_delete.add(blk.conflict_start_line)
+                if blk.conflict_sep_line is not None:
+                    lines_to_delete.add(blk.conflict_sep_line)
+                if blk.conflict_end_line is not None:
+                    lines_to_delete.add(blk.conflict_end_line)
 
     if file_modified and not dry_run:
         new_lines = [line for idx, line in enumerate(lines) if idx not in lines_to_delete]
@@ -298,12 +378,12 @@ def main() -> None:
     parser.add_argument(
         "--keep-first",
         action="store_true",
-        help="Automatically keep the first occurrence of duplicate columns without prompting.",
+        help="Automatically keep the first occurrence / Current Change without prompting.",
     )
     parser.add_argument(
         "--keep-last",
         action="store_true",
-        help="Automatically keep the last occurrence of duplicate columns without prompting.",
+        help="Automatically keep the last occurrence / Incoming Change without prompting.",
     )
 
     args = parser.parse_args()
