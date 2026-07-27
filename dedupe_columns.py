@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Duplicate Column Resolver for Power BI PBIP / TMDL files.
-Scans files sequentially for duplicate column definitions, identifies whether each
-definition originated from Current Change (HEAD) or Incoming Change (branch),
-displays the options, and prompts the user to select which definition to keep.
+Scans files sequentially for duplicate column definitions, extracts and compares
+their lineageTag / sourceLineageTag values, displays whether each option originated
+from Current Change (HEAD) or Incoming Change (branch), and prompts the user to select
+which definition to keep (or skip).
 """
 
 import argparse
@@ -45,6 +46,12 @@ class SummaryStats:
 # Regex to detect TMDL column header line (e.g. "column SPECIAL_SENSITIVE_SEC" or "column 'Special Column'")
 COLUMN_HEADER_PATTERN = re.compile(r'^(?P<indent>\s*)column\s+(?P<header>.+)$', re.IGNORECASE)
 
+# Regex to match lineageTag or sourceLineageTag property lines
+TAG_PATTERN = re.compile(
+    r'^\s*(?:"?(lineageTag|sourceLineageTag)"?)\s*:\s*(.+)$',
+    re.IGNORECASE
+)
+
 
 def get_indent_level(indent_str: str) -> int:
     """Calculates indentation level converting tabs to 4 spaces."""
@@ -57,6 +64,24 @@ def extract_column_name(header_str: str) -> str:
     if len(name_part) >= 2 and name_part[0] in ("'", '"', '`') and name_part[0] == name_part[-1]:
         return name_part[1:-1]
     return name_part
+
+
+def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extracts (lineageTag_value, sourceLineageTag_value) from lines of a column block.
+    """
+    lineage_tag = None
+    source_lineage_tag = None
+    for line in lines:
+        match = TAG_PATTERN.match(line.strip())
+        if match:
+            key_name = match.group(1).lower()
+            val = match.group(2).strip()
+            if key_name == "lineagetag":
+                lineage_tag = val
+            elif key_name == "sourcelineagetag":
+                source_lineage_tag = val
+    return lineage_tag, source_lineage_tag
 
 
 def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
@@ -102,7 +127,6 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
             ref = stripped[7:].strip()
             inc_label = f"Incoming Change ({ref if ref else 'incoming'})"
             conflict_end_idx = i
-            # Update labels and markers for blocks in this conflict region
             for blk in active_conflict_blocks:
                 if blk.git_side == "INCOMING":
                     blk.git_label = inc_label
@@ -131,12 +155,10 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
                 curr_line = lines[j]
                 curr_stripped = curr_line.strip()
 
-                # Stop if we hit a conflict marker while parsing block
                 if curr_stripped.startswith("=======") or curr_stripped.startswith(">>>>>>>") or curr_stripped.startswith("<<<<<<<"):
                     break
 
                 if not curr_stripped:
-                    # Look ahead to next non-blank line
                     k = j + 1
                     next_indent = None
                     while k < n:
@@ -201,7 +223,7 @@ def resolve_file_duplicates(
 ) -> Tuple[List[str], bool]:
     """
     Checks a single file for duplicate column blocks and resolves them interactively or automatically.
-    Displays whether each option came from Current Change (HEAD) or Incoming Change (branch).
+    Displays lineageTag values and Current/Incoming origin for clear comparison during selection.
     """
     blocks = extract_column_blocks(lines)
     duplicate_groups = group_duplicate_columns(blocks)
@@ -225,8 +247,10 @@ def resolve_file_duplicates(
         if dry_run:
             print(f"\n[DRY-RUN] Column '{col_display_name}' has {num_options} duplicate definitions:")
             for idx, blk in enumerate(col_blocks, 1):
+                lt, slt = extract_lineage_tags(blk.lines)
+                tag_info = f" | lineageTag: {lt}" if lt else f" | sourceLineageTag: {slt}" if slt else ""
                 label_info = f" [{blk.git_label}]" if blk.git_label else f" [Occurrence {idx}]"
-                print(f"  Option [{idx}]{label_info}: lines {blk.start_line + 1}-{blk.end_line}")
+                print(f"  Option [{idx}]{label_info}{tag_info}: lines {blk.start_line + 1}-{blk.end_line}")
             continue
 
         selected_idx: Optional[int] = None
@@ -242,8 +266,22 @@ def resolve_file_duplicates(
             print(f"\n[AUTO-KEEP LAST] Selected Option {num_options}{label_str} for column '{col_display_name}'")
         else:
             print(f"\nDuplicate definitions for column: '{col_display_name}'")
+            print("  • LineageTag Comparison Summary:")
+
             for idx, blk in enumerate(col_blocks, 1):
-                origin = f" [{blk.git_label}]" if blk.git_label else f" [{idx}st Occurrence]" if idx == 1 else f" [{idx}nd Occurrence]" if idx == 2 else f" [{idx}th Occurrence]"
+                lt, slt = extract_lineage_tags(blk.lines)
+                if lt:
+                    tag_desc = f"lineageTag: {lt}"
+                elif slt:
+                    tag_desc = f"sourceLineageTag: {slt}"
+                else:
+                    tag_desc = "lineageTag: (none)"
+
+                origin_desc = f"  [{blk.git_label}]" if blk.git_label else ""
+                print(f"      Option [{idx}]: {tag_desc}{origin_desc} (Line {blk.start_line + 1})")
+
+            for idx, blk in enumerate(col_blocks, 1):
+                origin = f" [{blk.git_label}]" if blk.git_label else f" [Occurrence {idx}]"
                 print(f"\n--- Option [{idx}]{origin} (Lines {blk.start_line + 1}-{blk.end_line}) ---")
                 print(blk.display_text)
 
@@ -269,11 +307,9 @@ def resolve_file_duplicates(
             file_modified = True
             for idx, blk in enumerate(col_blocks):
                 if idx != selected_idx:
-                    # Delete non-selected column block lines
                     for line_no in range(blk.start_line, blk.end_line):
                         lines_to_delete.add(line_no)
 
-            # If inside Git conflict block, clean up Git conflict marker lines (<<<<<<<, =======, >>>>>>>)
             for blk in col_blocks:
                 if blk.conflict_start_line is not None:
                     lines_to_delete.add(blk.conflict_start_line)
@@ -446,4 +482,3 @@ if __name__ == "__main__":
 # python dedupe_columns.py "C:/path/to/folder"
 # python dedupe_columns.py "C:/path/to/folder" --dry-run
 # python dedupe_columns.py "C:/path/to/folder" --extensions tmdl,json
-# python dedupe_columns.py "C:/path/to/folder" --keep-first
