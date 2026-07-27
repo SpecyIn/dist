@@ -4,8 +4,9 @@ Duplicate Column Resolver for Power BI PBIP / TMDL files.
 Scans files sequentially for duplicate column definitions, extracts and compares
 their lineageTag / sourceLineageTag values, queries Git history (git show HEAD) if
 conflict markers were already removed (e.g. after accepting both changes), displays whether
-each option originated from Current Branch (HEAD) or Incoming Change (branch), and prompts
-the user to select which definition to keep (or skip).
+each option originated from Current Branch (HEAD) or Incoming Change (branch), tracks
+remaining duplicate counts per-file and total across all files, and prompts the user to select
+which definition to keep (or skip).
 """
 
 import argparse
@@ -33,6 +34,14 @@ class ColumnBlock:
     @property
     def display_text(self) -> str:
         return "".join(self.lines).rstrip()
+
+
+@dataclass
+class FileTask:
+    file_path: Path
+    has_bom: bool
+    lines: List[str]
+    duplicate_groups: Dict[str, List[ColumnBlock]]
 
 
 @dataclass
@@ -98,7 +107,6 @@ def get_git_head_content(file_path: Path) -> Optional[str]:
     using git CLI commands.
     """
     try:
-        # Get repository root directory
         repo_root_cmd = ["git", "rev-parse", "--show-toplevel"]
         res = subprocess.run(
             repo_root_cmd,
@@ -190,7 +198,6 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
         line = lines[i]
         stripped = line.strip()
 
-        # Check for Git conflict markers
         if stripped.startswith("<<<<<<<"):
             in_conflict = True
             current_side = "CURRENT"
@@ -303,41 +310,103 @@ def group_duplicate_columns(blocks: List[ColumnBlock]) -> Dict[str, List[ColumnB
     return {k: v for k, v in grouped.items() if len(v) > 1}
 
 
-def resolve_file_duplicates(
-    file_path: Path,
-    lines: List[str],
+def parse_extensions(ext_str: Optional[str]) -> Optional[Set[str]]:
+    """Parses comma-separated extension string into a normalized set."""
+    if not ext_str:
+        return None
+    exts = {e.strip().lstrip(".").lower() for e in ext_str.split(",") if e.strip()}
+    return exts if exts else None
+
+
+def should_process_file(file_path: Path, extensions: Optional[Set[str]]) -> bool:
+    """Checks if file extension matches the filter."""
+    if extensions is None:
+        return True
+    ext = file_path.suffix.lstrip(".").lower()
+    return ext in extensions
+
+
+def scan_and_prepare_tasks(
+    target_files: List[Path], stats: SummaryStats
+) -> Tuple[List[FileTask], int]:
+    """
+    Pre-scans all target files to filter binary/non-UTF8 files and collect
+    files containing duplicate columns along with total duplicate count.
+    """
+    tasks: List[FileTask] = []
+    total_duplicates_all = 0
+
+    for file_path in target_files:
+        try:
+            with open(file_path, "rb") as f:
+                chunk = f.read(8192)
+                if b"\x00" in chunk:
+                    stats.files_skipped += 1
+                    continue
+                f.seek(0)
+                raw_bytes = f.read()
+        except Exception:
+            stats.files_skipped += 1
+            continue
+
+        has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
+        try:
+            if has_bom:
+                content = raw_bytes[3:].decode("utf-8")
+            else:
+                content = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            stats.files_skipped += 1
+            continue
+
+        stats.files_scanned += 1
+        lines = content.splitlines(keepends=True)
+        blocks = extract_column_blocks(lines)
+        duplicate_groups = group_duplicate_columns(blocks)
+
+        if duplicate_groups:
+            tasks.append(FileTask(
+                file_path=file_path,
+                has_bom=has_bom,
+                lines=lines,
+                duplicate_groups=duplicate_groups
+            ))
+            total_duplicates_all += len(duplicate_groups)
+
+    return tasks, total_duplicates_all
+
+
+def process_file_task(
+    task: FileTask,
+    file_idx: int,
+    total_files: int,
     dry_run: bool,
     auto_keep: Optional[str],
+    global_remaining: List[int],
     stats: SummaryStats
-) -> Tuple[List[str], bool]:
+) -> None:
     """
-    Checks a single file for duplicate column blocks and resolves them interactively or automatically.
-    Displays lineageTag values and Current/Incoming origin for clear comparison during selection.
+    Processes duplicate columns for a single file task and displays remaining counts per file and total.
     """
-    blocks = extract_column_blocks(lines)
-    duplicate_groups = group_duplicate_columns(blocks)
-
-    if not duplicate_groups:
-        return lines, False
-
+    num_dups_in_file = len(task.duplicate_groups)
+    dups_remaining_in_file = num_dups_in_file
     lines_to_delete: Set[int] = set()
     file_modified = False
 
     print(f"\n================================================================================")
-    print(f"Processing File: {file_path}")
-    print(f"Found {len(duplicate_groups)} column(s) with duplicate definitions.")
+    print(f"Processing File [{file_idx}/{total_files}]: {task.file_path}")
+    print(f"Found {num_dups_in_file} column(s) with duplicate definitions in this file.")
     print(f"================================================================================")
 
-    for col_key, col_blocks in duplicate_groups.items():
-        # Check Git history to label HEAD vs Incoming if conflict markers were already removed
-        check_git_origin_for_blocks(file_path, col_blocks)
+    for col_idx, (col_key, col_blocks) in enumerate(task.duplicate_groups.items(), 1):
+        check_git_origin_for_blocks(task.file_path, col_blocks)
 
         col_display_name = col_blocks[0].col_name
         stats.duplicates_found += 1
         num_options = len(col_blocks)
 
         if dry_run:
-            print(f"\n[DRY-RUN] Column '{col_display_name}' has {num_options} duplicate definitions:")
+            print(f"\n[DRY-RUN] Column {col_idx}/{num_dups_in_file} ('{col_display_name}') - {num_options} duplicate definitions:")
             for idx, blk in enumerate(col_blocks, 1):
                 lt, slt = extract_lineage_tags(blk.lines)
                 tag_info = f" | lineageTag: {lt}" if lt else f" | sourceLineageTag: {slt}" if slt else ""
@@ -357,7 +426,8 @@ def resolve_file_duplicates(
             label_str = f" ({last_blk.git_label})" if last_blk.git_label else ""
             print(f"\n[AUTO-KEEP LAST] Selected Option {num_options}{label_str} for column '{col_display_name}'")
         else:
-            print(f"\nDuplicate definitions for column: '{col_display_name}'")
+            print(f"\nDuplicate {col_idx} of {num_dups_in_file} for column: '{col_display_name}'")
+            print(f"  --> Remaining in THIS file: {dups_remaining_in_file} | TOTAL remaining across all files: {global_remaining[0]}")
             print("  • LineageTag Comparison Summary:")
 
             for idx, blk in enumerate(col_blocks, 1):
@@ -394,6 +464,9 @@ def resolve_file_duplicates(
                         break
                 print(f"Invalid input. Please enter a number between 1 and {num_options}, or 's'.")
 
+        dups_remaining_in_file -= 1
+        global_remaining[0] -= 1
+
         if selected_idx is not None:
             stats.duplicates_resolved += 1
             file_modified = True
@@ -411,76 +484,15 @@ def resolve_file_duplicates(
                     lines_to_delete.add(blk.conflict_end_line)
 
     if file_modified and not dry_run:
-        new_lines = [line for idx, line in enumerate(lines) if idx not in lines_to_delete]
-        return new_lines, True
-
-    return lines, False
-
-
-def process_file(
-    file_path: Path,
-    dry_run: bool,
-    auto_keep: Optional[str],
-    stats: SummaryStats
-) -> None:
-    """Reads, processes, and writes a file if duplicate columns were resolved."""
-    try:
-        with open(file_path, "rb") as f:
-            chunk = f.read(8192)
-            if b"\x00" in chunk:
-                stats.files_skipped += 1
-                return
-            f.seek(0)
-            raw_bytes = f.read()
-    except Exception:
-        stats.files_skipped += 1
-        return
-
-    has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
-    try:
-        if has_bom:
-            content = raw_bytes[3:].decode("utf-8")
-        else:
-            content = raw_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        stats.files_skipped += 1
-        return
-
-    stats.files_scanned += 1
-    lines = content.splitlines(keepends=True)
-
-    new_lines, was_modified = resolve_file_duplicates(
-        file_path, lines, dry_run, auto_keep, stats
-    )
-
-    if was_modified:
         stats.files_modified += 1
-        if not dry_run:
-            new_content = "".join(new_lines)
-            encoded_data = new_content.encode("utf-8")
-            if has_bom:
-                encoded_data = b"\xef\xbb\xbf" + encoded_data
-            with open(file_path, "wb") as f:
-                f.write(encoded_data)
-            print(f"\n[UPDATED] File updated: {file_path}")
-        else:
-            print(f"\n[DRY-RUN] Would update file: {file_path}")
-
-
-def parse_extensions(ext_str: Optional[str]) -> Optional[Set[str]]:
-    """Parses comma-separated extension string into a normalized set."""
-    if not ext_str:
-        return None
-    exts = {e.strip().lstrip(".").lower() for e in ext_str.split(",") if e.strip()}
-    return exts if exts else None
-
-
-def should_process_file(file_path: Path, extensions: Optional[Set[str]]) -> bool:
-    """Checks if file extension matches the filter."""
-    if extensions is None:
-        return True
-    ext = file_path.suffix.lstrip(".").lower()
-    return ext in extensions
+        new_lines = [line for idx, line in enumerate(task.lines) if idx not in lines_to_delete]
+        new_content = "".join(new_lines)
+        encoded_data = new_content.encode("utf-8")
+        if task.has_bom:
+            encoded_data = b"\xef\xbb\xbf" + encoded_data
+        with open(task.file_path, "wb") as f:
+            f.write(encoded_data)
+        print(f"\n[UPDATED] File updated: {task.file_path}")
 
 
 def main() -> None:
@@ -540,18 +552,28 @@ def main() -> None:
         auto_keep = "last"
 
     stats = SummaryStats()
+    target_files: List[Path] = []
 
     if target_path.is_file():
-        process_file(target_path, args.dry_run, auto_keep, stats)
+        target_files.append(target_path)
     elif target_path.is_dir():
         for root, _, files in os.walk(target_path):
             for file in files:
                 file_path = Path(root) / file
                 if should_process_file(file_path, extensions_set):
-                    process_file(file_path, args.dry_run, auto_keep, stats)
+                    target_files.append(file_path)
     else:
         print(f"Error: Path '{target_path}' is neither a file nor a directory.", file=sys.stderr)
         sys.exit(1)
+
+    tasks, total_duplicates_all = scan_and_prepare_tasks(target_files, stats)
+    global_remaining = [total_duplicates_all]
+    total_files = len(tasks)
+
+    for file_idx, task in enumerate(tasks, 1):
+        process_file_task(
+            task, file_idx, total_files, args.dry_run, auto_keep, global_remaining, stats
+        )
 
     print("\n--- Summary ---")
     print(f"Files scanned: {stats.files_scanned}")
