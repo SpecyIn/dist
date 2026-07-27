@@ -120,7 +120,7 @@ def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]
 
 def compute_block_differences(col_blocks: List[ColumnBlock]) -> Tuple[List[str], List[Set[int]]]:
     """
-    Computes property and line differences between duplicate column blocks.
+    Computes exact property and line differences between duplicate column blocks.
     Returns:
       diff_summary: list of formatted strings describing property diffs in color.
       differing_lines_per_block: list of sets containing line indices within each block that differ.
@@ -129,28 +129,35 @@ def compute_block_differences(col_blocks: List[ColumnBlock]) -> Tuple[List[str],
     differing_lines_per_block: List[Set[int]] = [set() for _ in col_blocks]
 
     if len(col_blocks) >= 2:
-        lines1 = [l.rstrip("\r\n") for l in col_blocks[0].lines]
-        lines2 = [l.rstrip("\r\n") for l in col_blocks[1].lines]
+        lines1_clean = [l.strip() for l in col_blocks[0].lines if l.strip()]
+        lines2_clean = [l.strip() for l in col_blocks[1].lines if l.strip()]
 
-        # Compare key-value properties
-        props1 = {l.split(":")[0].strip().lower(): l.strip() for l in lines1 if ":" in l}
-        props2 = {l.split(":")[0].strip().lower(): l.strip() for l in lines2 if ":" in l}
-
-        all_keys = set(props1.keys()) | set(props2.keys())
-        for key in sorted(all_keys):
-            v1 = props1.get(key)
-            v2 = props2.get(key)
-            if v1 != v2:
-                if v1 and v2:
-                    diff_summary.append(f"{CLR_RED}      - Option [1]: {v1}{CLR_RESET}\n{CLR_GREEN}      + Option [2]: {v2}{CLR_RESET}")
-                elif v1:
-                    diff_summary.append(f"{CLR_RED}      - Option [1]: {v1}{CLR_RESET}\n{CLR_GREEN}      + Option [2]: (missing property){CLR_RESET}")
-                else:
-                    diff_summary.append(f"{CLR_RED}      - Option [1]: (missing property){CLR_RESET}\n{CLR_GREEN}      + Option [2]: {v2}{CLR_RESET}")
-
-        # Mark line-by-line differences using difflib
-        matcher = difflib.SequenceMatcher(None, [l.strip() for l in lines1], [l.strip() for l in lines2])
+        matcher = difflib.SequenceMatcher(None, lines1_clean, lines2_clean)
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'replace':
+                for a_idx, b_idx in zip(range(i1, i2), range(j1, j2)):
+                    diff_summary.append(
+                        f"{CLR_RED}      - Option [1]: {lines1_clean[a_idx]}{CLR_RESET}\n"
+                        f"{CLR_GREEN}      + Option [2]: {lines2_clean[b_idx]}{CLR_RESET}"
+                    )
+            elif tag == 'delete':
+                for a_idx in range(i1, i2):
+                    diff_summary.append(
+                        f"{CLR_RED}      - Option [1]: {lines1_clean[a_idx]}{CLR_RESET}\n"
+                        f"{CLR_GREEN}      + Option [2]: (missing in Option 2){CLR_RESET}"
+                    )
+            elif tag == 'insert':
+                for b_idx in range(j1, j2):
+                    diff_summary.append(
+                        f"{CLR_RED}      - Option [1]: (missing in Option 1){CLR_RESET}\n"
+                        f"{CLR_GREEN}      + Option [2]: {lines2_clean[b_idx]}{CLR_RESET}"
+                    )
+
+        # Mark line-by-line differences in original unstripped lines
+        orig_lines1 = [l.rstrip("\r\n") for l in col_blocks[0].lines]
+        orig_lines2 = [l.rstrip("\r\n") for l in col_blocks[1].lines]
+        orig_matcher = difflib.SequenceMatcher(None, [l.strip() for l in orig_lines1], [l.strip() for l in orig_lines2])
+        for tag, i1, i2, j1, j2 in orig_matcher.get_opcodes():
             if tag != 'equal':
                 for idx in range(i1, i2):
                     differing_lines_per_block[0].add(idx)
