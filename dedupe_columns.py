@@ -2,14 +2,15 @@
 """
 Duplicate Column Resolver for Power BI PBIP / TMDL files.
 Scans files sequentially for duplicate column definitions, extracts and compares
-their lineageTag / sourceLineageTag values, queries Git history (git show HEAD) if
-conflict markers were already removed (e.g. after accepting both changes), displays whether
-each option originated from Current Branch (HEAD) or Incoming Change (branch), tracks
-remaining duplicate counts per-file and total across all files, and prompts the user to select
-which definition to keep (or skip).
+their lineageTag / sourceLineageTag values, computes and highlights exact line/property
+differences between options, queries Git history (git show HEAD) if conflict markers were
+already removed (e.g. after accepting both changes), displays whether each option originated
+from Current Branch (HEAD) or Incoming Change (branch), tracks remaining duplicate counts per-file
+and total across all files, and prompts the user to select which definition to keep (or skip).
 """
 
 import argparse
+import difflib
 import os
 import re
 import subprocess
@@ -99,6 +100,62 @@ def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]
             elif key_name == "sourcelineagetag":
                 source_lineage_tag = val
     return lineage_tag, source_lineage_tag
+
+
+def compute_block_differences(col_blocks: List[ColumnBlock]) -> Tuple[List[str], List[Set[int]]]:
+    """
+    Computes property and line differences between duplicate column blocks.
+    Returns:
+      diff_summary: list of formatted strings describing property diffs.
+      differing_lines_per_block: list of sets containing line indices within each block that differ.
+    """
+    diff_summary: List[str] = []
+    differing_lines_per_block: List[Set[int]] = [set() for _ in col_blocks]
+
+    if len(col_blocks) >= 2:
+        lines1 = [l.rstrip("\r\n") for l in col_blocks[0].lines]
+        lines2 = [l.rstrip("\r\n") for l in col_blocks[1].lines]
+
+        # Compare key-value properties
+        props1 = {l.split(":")[0].strip().lower(): l.strip() for l in lines1 if ":" in l}
+        props2 = {l.split(":")[0].strip().lower(): l.strip() for l in lines2 if ":" in l}
+
+        all_keys = set(props1.keys()) | set(props2.keys())
+        for key in sorted(all_keys):
+            v1 = props1.get(key)
+            v2 = props2.get(key)
+            if v1 != v2:
+                if v1 and v2:
+                    diff_summary.append(f"      - Option [1]: {v1}\n      + Option [2]: {v2}")
+                elif v1:
+                    diff_summary.append(f"      - Option [1]: {v1}\n      + Option [2]: (missing)")
+                else:
+                    diff_summary.append(f"      - Option [1]: (missing)\n      + Option [2]: {v2}")
+
+        # Mark line-by-line differences using difflib
+        matcher = difflib.SequenceMatcher(None, lines1, lines2)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag != 'equal':
+                for idx in range(i1, i2):
+                    differing_lines_per_block[0].add(idx)
+                for idx in range(j1, j2):
+                    differing_lines_per_block[1].add(idx)
+
+    return diff_summary, differing_lines_per_block
+
+
+def format_block_with_diff_highlights(block: ColumnBlock, diff_indices: Set[int]) -> str:
+    """
+    Formats the lines of a column block, marking differing lines with a '*' indicator and tag.
+    """
+    formatted_lines = []
+    for idx, line in enumerate(block.lines):
+        clean_line = line.rstrip("\r\n")
+        if idx in diff_indices:
+            formatted_lines.append(f"  * {clean_line}   <-- DIFFERENT")
+        else:
+            formatted_lines.append(f"    {clean_line}")
+    return "\n".join(formatted_lines)
 
 
 def get_git_head_content(file_path: Path) -> Optional[str]:
@@ -386,7 +443,8 @@ def process_file_task(
     stats: SummaryStats
 ) -> None:
     """
-    Processes duplicate columns for a single file task and displays remaining counts per file and total.
+    Processes duplicate columns for a single file task, displaying highlighted diffs
+    and remaining duplicate counts per file and total across all files.
     """
     num_dups_in_file = len(task.duplicate_groups)
     dups_remaining_in_file = num_dups_in_file
@@ -404,6 +462,8 @@ def process_file_task(
         col_display_name = col_blocks[0].col_name
         stats.duplicates_found += 1
         num_options = len(col_blocks)
+
+        diff_summary, diff_indices = compute_block_differences(col_blocks)
 
         if dry_run:
             print(f"\n[DRY-RUN] Column {col_idx}/{num_dups_in_file} ('{col_display_name}') - {num_options} duplicate definitions:")
@@ -428,8 +488,8 @@ def process_file_task(
         else:
             print(f"\nDuplicate {col_idx} of {num_dups_in_file} for column: '{col_display_name}'")
             print(f"  --> Remaining in THIS file: {dups_remaining_in_file} | TOTAL remaining across all files: {global_remaining[0]}")
-            print("  • LineageTag Comparison Summary:")
-
+            
+            print("\n  • LineageTag Comparison Summary:")
             for idx, blk in enumerate(col_blocks, 1):
                 lt, slt = extract_lineage_tags(blk.lines)
                 if lt:
@@ -442,10 +502,18 @@ def process_file_task(
                 origin_desc = f"  [{blk.git_label}]" if blk.git_label else f"  [Occurrence {idx}]"
                 print(f"      Option [{idx}]: {tag_desc}{origin_desc} (Line {blk.start_line + 1})")
 
+            if diff_summary:
+                print("\n  • Key Differences Highlight:")
+                for d_line in diff_summary:
+                    print(d_line)
+
             for idx, blk in enumerate(col_blocks, 1):
                 origin = f" [{blk.git_label}]" if blk.git_label else f" [Occurrence {idx}]"
+                diff_set = diff_indices[idx - 1] if idx - 1 < len(diff_indices) else set()
+                formatted_body = format_block_with_diff_highlights(blk, diff_set)
+
                 print(f"\n--- Option [{idx}]{origin} (Lines {blk.start_line + 1}-{blk.end_line}) ---")
-                print(blk.display_text)
+                print(formatted_body)
 
             print("-" * 60)
             while True:
