@@ -10,7 +10,9 @@ Capabilities:
 2. Mode 2: Deduplicate Objects (Columns, Expressions, Relationships) when conflict markers are absent (e.g. Accept Both Changes).
 3. Mode 3: Full Combo (Run Mode 1 then Mode 2 sequentially).
 
-Features:
+Advanced Checks & Features:
+- Reverse Relationship Duplicate Detection: Detects relationships connecting the same two columns regardless of order (fromA->toB vs fromB->toA).
+- Column Reference Normalization: Strips quotes and extra spaces so unquoted and quoted column references match.
 - Automatic Blank Line Cleanup: Collapses multiple consecutive empty lines resulting from deleted blocks.
 - ANSI Color Highlighting and Diff Summaries.
 - Case-insensitive Windows Path Resolution & Git History Lookup (git show HEAD).
@@ -150,6 +152,29 @@ def extract_column_name(header_str: str) -> str:
     if len(name_part) >= 2 and name_part[0] in ("'", '"', '`') and name_part[0] == name_part[-1]:
         return name_part[1:-1]
     return name_part
+
+
+def normalize_column_ref(ref_str: str) -> str:
+    """
+    Normalizes TMDL column reference string (e.g. "'Sales' [CustomerKey]" -> "sales[customerkey]").
+    Removes quotes around table/column names and extra spaces for 100% accurate matching.
+    """
+    if not ref_str:
+        return ""
+    s = re.sub(r"['\"`]", "", ref_str.strip())
+    s = re.sub(r"\s*\[\s*", "[", s)
+    s = re.sub(r"\s*\]\s*", "]", s)
+    return s.lower()
+
+
+def get_canonical_relationship_key(from_col: str, to_col: str) -> Tuple[str, str]:
+    """
+    Returns a sorted tuple of normalized (colA, colB) so that reverse relationships
+    (fromA->toB and fromB->toA) map to the EXACT SAME canonical key.
+    """
+    norm_from = normalize_column_ref(from_col)
+    norm_to = normalize_column_ref(to_col)
+    return tuple(sorted([norm_from, norm_to]))
 
 
 def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -334,12 +359,25 @@ def check_git_origin_for_blocks(
     head_blocks = extract_column_blocks(head_lines)
 
     target_type = col_blocks[0].obj_type.lower()
-    target_name = col_blocks[0].col_name.lower()
 
-    head_matches = [
-        b for b in head_blocks
-        if b.obj_type.lower() == target_type and b.col_name.lower() == target_name
-    ]
+    if target_type == "relationship":
+        from_c, to_c = extract_relationship_columns(col_blocks[0].lines)
+        if from_c and to_c:
+            canon_key = get_canonical_relationship_key(from_c, to_c)
+            head_matches = [
+                b for b in head_blocks
+                if b.obj_type.lower() == "relationship" and extract_relationship_columns(b.lines)[0] and
+                get_canonical_relationship_key(*extract_relationship_columns(b.lines)) == canon_key
+            ]
+        else:
+            head_matches = []
+    else:
+        target_name = col_blocks[0].col_name.lower()
+        head_matches = [
+            b for b in head_blocks
+            if b.obj_type.lower() == target_type and b.col_name.lower() == target_name
+        ]
+
     if not head_matches:
         return
 
@@ -554,13 +592,24 @@ def group_duplicate_columns(
     blocks: List[ColumnBlock], target_object_type: str = "all"
 ) -> Dict[Tuple[str, str], List[ColumnBlock]]:
     """
-    Groups object blocks by (obj_type, obj_name.lower()) and filters by target_object_type.
+    Groups object blocks by canonical key and filters by target_object_type.
+    For relationships, matches reverse duplicates (fromA->toB and fromB->toA) using canonical column pair keys.
     """
     grouped: Dict[Tuple[str, str], List[ColumnBlock]] = {}
     for block in blocks:
         if target_object_type != "all" and block.obj_type.lower() != target_object_type.lower():
             continue
-        key = (block.obj_type.lower(), block.col_name.lower())
+
+        if block.obj_type.lower() == "relationship":
+            from_c, to_c = extract_relationship_columns(block.lines)
+            if from_c and to_c:
+                canon_key = get_canonical_relationship_key(from_c, to_c)
+                key = ("relationship", f"{canon_key[0]} <-> {canon_key[1]}")
+            else:
+                key = ("relationship", block.col_name.lower())
+        else:
+            key = (block.obj_type.lower(), block.col_name.lower())
+
         grouped.setdefault(key, []).append(block)
 
     return {k: v for k, v in grouped.items() if len(v) > 1}
