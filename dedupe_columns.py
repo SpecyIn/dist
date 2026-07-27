@@ -2,7 +2,7 @@
 """
 Duplicate Column Resolver for Power BI PBIP / TMDL files.
 Scans files sequentially for duplicate column definitions, extracts and compares
-their lineageTag / sourceLineageTag values, computes and highlights exact line/property
+their lineageTag / sourceLineageTag values, computes and ANSI-color highlights exact line/property
 differences between options, queries Git history (git show HEAD) if conflict markers were
 already removed (e.g. after accepting both changes), displays whether each option originated
 from Current Branch (HEAD) or Incoming Change (branch), tracks remaining duplicate counts per-file
@@ -18,6 +18,22 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
+# Enable ANSI escape sequences on Windows console
+if sys.platform == "win32":
+    try:
+        os.system("")
+    except Exception:
+        pass
+
+# ANSI Color Codes for Terminal Highlighting
+CLR_RESET = "\033[0m"
+CLR_BOLD = "\033[1m"
+CLR_YELLOW = "\033[1;33m"
+CLR_GREEN = "\033[1;32m"
+CLR_RED = "\033[1;31m"
+CLR_CYAN = "\033[1;36m"
+CLR_BG_YELLOW = "\033[43;30m"
 
 
 @dataclass
@@ -106,7 +122,7 @@ def compute_block_differences(col_blocks: List[ColumnBlock]) -> Tuple[List[str],
     """
     Computes property and line differences between duplicate column blocks.
     Returns:
-      diff_summary: list of formatted strings describing property diffs.
+      diff_summary: list of formatted strings describing property diffs in color.
       differing_lines_per_block: list of sets containing line indices within each block that differ.
     """
     diff_summary: List[str] = []
@@ -126,14 +142,14 @@ def compute_block_differences(col_blocks: List[ColumnBlock]) -> Tuple[List[str],
             v2 = props2.get(key)
             if v1 != v2:
                 if v1 and v2:
-                    diff_summary.append(f"      - Option [1]: {v1}\n      + Option [2]: {v2}")
+                    diff_summary.append(f"{CLR_RED}      - Option [1]: {v1}{CLR_RESET}\n{CLR_GREEN}      + Option [2]: {v2}{CLR_RESET}")
                 elif v1:
-                    diff_summary.append(f"      - Option [1]: {v1}\n      + Option [2]: (missing)")
+                    diff_summary.append(f"{CLR_RED}      - Option [1]: {v1}{CLR_RESET}\n{CLR_GREEN}      + Option [2]: (missing property){CLR_RESET}")
                 else:
-                    diff_summary.append(f"      - Option [1]: (missing)\n      + Option [2]: {v2}")
+                    diff_summary.append(f"{CLR_RED}      - Option [1]: (missing property){CLR_RESET}\n{CLR_GREEN}      + Option [2]: {v2}{CLR_RESET}")
 
         # Mark line-by-line differences using difflib
-        matcher = difflib.SequenceMatcher(None, lines1, lines2)
+        matcher = difflib.SequenceMatcher(None, [l.strip() for l in lines1], [l.strip() for l in lines2])
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag != 'equal':
                 for idx in range(i1, i2):
@@ -146,13 +162,13 @@ def compute_block_differences(col_blocks: List[ColumnBlock]) -> Tuple[List[str],
 
 def format_block_with_diff_highlights(block: ColumnBlock, diff_indices: Set[int]) -> str:
     """
-    Formats the lines of a column block, marking differing lines with a '*' indicator and tag.
+    Formats the lines of a column block, highlighting differing lines with ANSI color, '*' indicator, and tag.
     """
     formatted_lines = []
     for idx, line in enumerate(block.lines):
         clean_line = line.rstrip("\r\n")
         if idx in diff_indices:
-            formatted_lines.append(f"  * {clean_line}   <-- DIFFERENT")
+            formatted_lines.append(f"{CLR_YELLOW}  * {clean_line}   <-- DIFFERENT{CLR_RESET}")
         else:
             formatted_lines.append(f"    {clean_line}")
     return "\n".join(formatted_lines)
@@ -451,10 +467,10 @@ def process_file_task(
     lines_to_delete: Set[int] = set()
     file_modified = False
 
-    print(f"\n================================================================================")
-    print(f"Processing File [{file_idx}/{total_files}]: {task.file_path}")
+    print(f"\n{CLR_CYAN}================================================================================{CLR_RESET}")
+    print(f"{CLR_BOLD}Processing File [{file_idx}/{total_files}]: {task.file_path}{CLR_RESET}")
     print(f"Found {num_dups_in_file} column(s) with duplicate definitions in this file.")
-    print(f"================================================================================")
+    print(f"{CLR_CYAN}================================================================================{CLR_RESET}")
 
     for col_idx, (col_key, col_blocks) in enumerate(task.duplicate_groups.items(), 1):
         check_git_origin_for_blocks(task.file_path, col_blocks)
@@ -486,10 +502,10 @@ def process_file_task(
             label_str = f" ({last_blk.git_label})" if last_blk.git_label else ""
             print(f"\n[AUTO-KEEP LAST] Selected Option {num_options}{label_str} for column '{col_display_name}'")
         else:
-            print(f"\nDuplicate {col_idx} of {num_dups_in_file} for column: '{col_display_name}'")
+            print(f"\n{CLR_BOLD}Duplicate {col_idx} of {num_dups_in_file} for column: '{col_display_name}'{CLR_RESET}")
             print(f"  --> Remaining in THIS file: {dups_remaining_in_file} | TOTAL remaining across all files: {global_remaining[0]}")
             
-            print("\n  • LineageTag Comparison Summary:")
+            print(f"\n{CLR_CYAN}  • LineageTag Comparison Summary:{CLR_RESET}")
             for idx, blk in enumerate(col_blocks, 1):
                 lt, slt = extract_lineage_tags(blk.lines)
                 if lt:
@@ -503,7 +519,7 @@ def process_file_task(
                 print(f"      Option [{idx}]: {tag_desc}{origin_desc} (Line {blk.start_line + 1})")
 
             if diff_summary:
-                print("\n  • Key Differences Highlight:")
+                print(f"\n{CLR_CYAN}  • Key Differences Highlight:{CLR_RESET}")
                 for d_line in diff_summary:
                     print(d_line)
 
@@ -512,7 +528,7 @@ def process_file_task(
                 diff_set = diff_indices[idx - 1] if idx - 1 < len(diff_indices) else set()
                 formatted_body = format_block_with_diff_highlights(blk, diff_set)
 
-                print(f"\n--- Option [{idx}]{origin} (Lines {blk.start_line + 1}-{blk.end_line}) ---")
+                print(f"\n{CLR_BOLD}--- Option [{idx}]{origin} (Lines {blk.start_line + 1}-{blk.end_line}) ---{CLR_RESET}")
                 print(formatted_body)
 
             print("-" * 60)
