@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Duplicate Object Resolver for Power BI PBIP / TMDL files.
-Scans files sequentially for duplicate column and/or expression definitions,
-extracts and compares their lineageTag / sourceLineageTag values and properties,
+Scans files sequentially for duplicate column, expression, measure, and relationship definitions,
+extracts and compares their lineageTag / sourceLineageTag values and properties (such as fromColumn/toColumn),
 computes and ANSI-color highlights exact line/property differences between options,
 queries Git history (git show HEAD) if conflict markers were already removed (e.g. after accepting both changes),
 displays Incoming Change ALWAYS on top (Option 1) and Current Change (HEAD) on bottom (Option 2),
@@ -39,8 +39,8 @@ CLR_BG_YELLOW = "\033[43;30m"
 
 @dataclass
 class ColumnBlock:
-    obj_type: str    # "column", "expression", "measure"
-    col_name: str    # object name
+    obj_type: str    # "column", "expression", "measure", "relationship"
+    col_name: str    # object name / relationship representation
     start_line: int  # 0-indexed line number inclusive
     end_line: int    # 0-indexed line number exclusive
     lines: List[str]
@@ -73,15 +73,15 @@ class SummaryStats:
     files_skipped: int = 0
 
 
-# Regex to detect TMDL column, expression, or measure header line
+# Regex to detect TMDL column, expression, measure, or relationship header line
 OBJECT_HEADER_PATTERN = re.compile(
-    r'^(?P<indent>\s*)(?P<type>column|expression|measure)\s+(?P<header>.+)$',
+    r'^(?P<indent>\s*)(?P<type>column|expression|measure|relationship)(?:\s+(?P<header>.+))?$',
     re.IGNORECASE
 )
 
 # Keywords that start a new object in TMDL at the same or lower indentation level
 OBJECT_KEYWORDS = re.compile(
-    r'^\s*(?:column|expression|measure|partition|table|hierarchy|ref|role|expression|perspective|culture)\b',
+    r'^\s*(?:column|expression|measure|relationship|partition|table|hierarchy|ref|role|perspective|culture)\b',
     re.IGNORECASE
 )
 
@@ -90,6 +90,10 @@ TAG_PATTERN = re.compile(
     r'^\s*["\']?(lineageTag|sourceLineageTag)["\']?\s*:\s*(.+)$',
     re.IGNORECASE
 )
+
+# Regex to match fromColumn and toColumn in relationships
+FROM_COL_PATTERN = re.compile(r'^\s*["\']?fromColumn["\']?\s*:\s*(.+)$', re.IGNORECASE)
+TO_COL_PATTERN = re.compile(r'^\s*["\']?toColumn["\']?\s*:\s*(.+)$', re.IGNORECASE)
 
 
 def get_indent_level(indent_str: str) -> int:
@@ -121,6 +125,22 @@ def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]
             elif key_name == "sourcelineagetag":
                 source_lineage_tag = val
     return lineage_tag, source_lineage_tag
+
+
+def extract_relationship_columns(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extracts (fromColumn_val, toColumn_val) from lines of a relationship block.
+    """
+    from_col = None
+    to_col = None
+    for line in lines:
+        match_from = FROM_COL_PATTERN.match(line)
+        if match_from:
+            from_col = match_from.group(1).strip()
+        match_to = TO_COL_PATTERN.match(line)
+        if match_to:
+            to_col = match_to.group(1).strip()
+    return from_col, to_col
 
 
 def sort_blocks_incoming_first(col_blocks: List[ColumnBlock]) -> List[ColumnBlock]:
@@ -303,7 +323,7 @@ def check_git_origin_for_blocks(
 
 def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
     """
-    Parses TMDL file lines and extracts all column, expression, and measure blocks,
+    Parses TMDL file lines and extracts all column, expression, measure, and relationship blocks,
     tracking whether each block is inside a Git merge conflict (HEAD vs incoming branch).
     """
     blocks: List[ColumnBlock] = []
@@ -361,9 +381,9 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
         if match:
             indent_str = match.group("indent")
             obj_type = match.group("type").lower()
-            header_str = match.group("header")
+            header_str = match.group("header") or ""
 
-            col_name = extract_column_name(header_str)
+            col_name = extract_column_name(header_str) if header_str else f"({obj_type})"
             header_indent = get_indent_level(indent_str)
             start_idx = i
             j = i + 1
@@ -405,6 +425,13 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
                         break
 
             block_lines = lines[start_idx:j]
+
+            # If relationship block, extract fromColumn -> toColumn to construct col_name
+            if obj_type == "relationship":
+                from_c, to_c = extract_relationship_columns(block_lines)
+                if from_c and to_c:
+                    col_name = f"{from_c} -> {to_c}"
+
             block = ColumnBlock(
                 obj_type=obj_type,
                 col_name=col_name,
@@ -431,6 +458,7 @@ def group_duplicate_columns(
 ) -> Dict[Tuple[str, str], List[ColumnBlock]]:
     """
     Groups object blocks by (obj_type, obj_name.lower()) and filters by target_object_type.
+    For relationships, matches duplicate blocks connecting the same fromColumn and toColumn.
     """
     grouped: Dict[Tuple[str, str], List[ColumnBlock]] = {}
     for block in blocks:
@@ -460,7 +488,7 @@ def should_process_file(file_path: Path, extensions: Optional[Set[str]]) -> bool
 
 def get_target_object_type(args_type: Optional[str]) -> str:
     """
-    Returns normalized target object type: 'column', 'expression', or 'all'.
+    Returns normalized target object type: 'column', 'expression', 'relationship', or 'all'.
     Prompts interactively if not provided as a CLI flag.
     """
     if args_type:
@@ -469,22 +497,27 @@ def get_target_object_type(args_type: Optional[str]) -> str:
             return "column"
         elif val in ("2", "expression", "expressions"):
             return "expression"
-        elif val in ("3", "all", "both"):
+        elif val in ("3", "relationship", "relationships"):
+            return "relationship"
+        elif val in ("4", "all", "both"):
             return "all"
 
     print("\nSelect target object type to process:")
     print(" 1 - Columns")
     print(" 2 - Expressions")
-    print(" 3 - All (Columns & Expressions)")
+    print(" 3 - Relationships")
+    print(" 4 - All (Columns, Expressions & Relationships)")
     while True:
-        choice = input("Enter option (1, 2, or 3): ").strip()
+        choice = input("Enter option (1, 2, 3, or 4): ").strip()
         if choice == "1":
             return "column"
         elif choice == "2":
             return "expression"
         elif choice == "3":
+            return "relationship"
+        elif choice == "4":
             return "all"
-        print("Invalid input. Please enter 1, 2, or 3.\n")
+        print("Invalid input. Please enter 1, 2, 3, or 4.\n")
 
 
 def scan_and_prepare_tasks(
@@ -671,7 +704,7 @@ def process_file_task(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Resolve duplicate column and/or expression definitions in Power BI PBIP / TMDL files."
+        description="Resolve duplicate column, expression, measure, and relationship definitions in Power BI PBIP / TMDL files."
     )
     parser.add_argument(
         "path",
@@ -680,8 +713,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--type",
-        choices=["1", "2", "3", "column", "expression", "all"],
-        help="Target object type: 1/column, 2/expression, or 3/all.",
+        choices=["1", "2", "3", "4", "column", "expression", "relationship", "all"],
+        help="Target object type: 1/column, 2/expression, 3/relationship, or 4/all.",
     )
     parser.add_argument(
         "--dry-run",
@@ -771,6 +804,6 @@ if __name__ == "__main__":
 
 # Example usage:
 # python dedupe_columns.py
-# python dedupe_columns.py "C:/path/to/folder" --type column
-# python dedupe_columns.py "C:/path/to/folder" --type expression
-# python dedupe_columns.py "C:/path/to/folder" --type all
+# python dedupe_columns.py "C:/path/to/relationships.tmdl" --type relationship
+# python dedupe_columns.py "C:/path/to/folder" --type 3
+# python dedupe_columns.py "C:/path/to/folder" --type 4
