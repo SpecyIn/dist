@@ -6,6 +6,7 @@ extracts and compares their lineageTag / sourceLineageTag values and properties 
 computes and ANSI-color highlights exact line/property differences between options,
 queries Git history (git show HEAD) if conflict markers were already removed (e.g. after accepting both changes),
 displays Incoming Change ALWAYS on top (Option 1) and Current Change (HEAD) on bottom (Option 2),
+supports '1A' to keep Option 1 (Incoming Change) for ALL remaining duplicates and '2A' to keep Option 2 (Current Branch) for ALL remaining duplicates,
 tracks remaining duplicate counts per-file and total across all files, and prompts the user to select
 which definition to keep (or skip).
 """
@@ -575,13 +576,14 @@ def process_file_task(
     file_idx: int,
     total_files: int,
     dry_run: bool,
-    auto_keep: Optional[str],
+    auto_keep_state: List[Optional[str]],
     global_remaining: List[int],
     stats: SummaryStats
 ) -> None:
     """
     Processes duplicate objects for a single file task, displaying highlighted diffs,
     ensuring Incoming Change is Option 1 (on top) and Current Change is Option 2 (on bottom),
+    supporting 1A (keep Option 1 for all remaining) and 2A (keep Option 2 for all remaining),
     and tracking remaining duplicate counts per file and total across all files.
     """
     num_dups_in_file = len(task.duplicate_groups)
@@ -615,15 +617,15 @@ def process_file_task(
 
         selected_idx: Optional[int] = None
 
-        if auto_keep == "first":
+        if auto_keep_state[0] == "first":
             selected_idx = 0
-            label_str = f" ({col_blocks[0].git_label})" if col_blocks[0].git_label else ""
-            print(f"\n[AUTO-KEEP FIRST] Selected Option 1{label_str} for {obj_type} '{col_display_name}'")
-        elif auto_keep == "last":
+            label_str = f" [{col_blocks[0].git_label}]" if col_blocks[0].git_label else ""
+            print(f"\n[AUTO-KEEP 1A] Selected Option 1{label_str} for {obj_type} '{col_display_name}'")
+        elif auto_keep_state[0] == "last":
             selected_idx = num_options - 1
             last_blk = col_blocks[-1]
-            label_str = f" ({last_blk.git_label})" if last_blk.git_label else ""
-            print(f"\n[AUTO-KEEP LAST] Selected Option {num_options}{label_str} for {obj_type} '{col_display_name}'")
+            label_str = f" [{last_blk.git_label}]" if last_blk.git_label else ""
+            print(f"\n[AUTO-KEEP 2A] Selected Option {num_options}{label_str} for {obj_type} '{col_display_name}'")
         else:
             print("\n" + CLR_BOLD + f"Duplicate {col_idx} of {num_dups_in_file} for {obj_type}: '{col_display_name}'" + CLR_RESET)
             print(f"  --> Remaining in THIS file: {dups_remaining_in_file} | TOTAL remaining across all files: {global_remaining[0]}")
@@ -656,20 +658,38 @@ def process_file_task(
 
             print("-" * 60)
             while True:
-                choice = input(
-                    f"Select option to KEEP for {obj_type} '{col_display_name}' (1-{num_options}, or 's' to skip): "
-                ).strip().lower()
+                prompt_msg = (
+                    f"Select option to KEEP for {obj_type} '{col_display_name}'\n"
+                    f"  (1 = Keep Option 1, 2 = Keep Option 2, 1A = Keep Option 1 for ALL, 2A = Keep Option 2 for ALL, s = skip): "
+                )
+                choice = input(prompt_msg).strip().lower()
 
                 if choice in ("s", "skip"):
                     print(f"Skipped duplicate {obj_type} '{col_display_name}'.")
                     stats.duplicates_skipped += 1
+                    break
+                elif choice == "1":
+                    selected_idx = 0
+                    break
+                elif choice == "2":
+                    selected_idx = 1
+                    break
+                elif choice in ("1a", "a1", "all1"):
+                    selected_idx = 0
+                    auto_keep_state[0] = "first"
+                    print(f"\n{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 1 [Incoming Change] for all remaining duplicates.{CLR_RESET}")
+                    break
+                elif choice in ("2a", "a2", "all2"):
+                    selected_idx = num_options - 1
+                    auto_keep_state[0] = "last"
+                    print(f"\n{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 2 [Current Branch] for all remaining duplicates.{CLR_RESET}")
                     break
                 elif choice.isdigit():
                     val = int(choice)
                     if 1 <= val <= num_options:
                         selected_idx = val - 1
                         break
-                print(f"Invalid input. Please enter a number between 1 and {num_options}, or 's'.")
+                print("Invalid input. Please enter 1, 2, 1A (all Incoming), 2A (all Current), or 's'.")
 
         dups_remaining_in_file -= 1
         global_remaining[0] -= 1
@@ -759,11 +779,13 @@ def main() -> None:
     ext_arg = None if args.extensions and args.extensions.lower() == "all" else args.extensions
     extensions_set = parse_extensions(ext_arg)
 
-    auto_keep = None
+    initial_auto_keep = None
     if args.keep_first:
-        auto_keep = "first"
+        initial_auto_keep = "first"
     elif args.keep_last:
-        auto_keep = "last"
+        initial_auto_keep = "last"
+
+    auto_keep_state = [initial_auto_keep]
 
     stats = SummaryStats()
     target_files: List[Path] = []
@@ -786,7 +808,7 @@ def main() -> None:
 
     for file_idx, task in enumerate(tasks, 1):
         process_file_task(
-            task, file_idx, total_files, args.dry_run, auto_keep, global_remaining, stats
+            task, file_idx, total_files, args.dry_run, auto_keep_state, global_remaining, stats
         )
 
     print("\n--- Summary ---")
@@ -804,6 +826,5 @@ if __name__ == "__main__":
 
 # Example usage:
 # python dedupe_columns.py
-# python dedupe_columns.py "C:/path/to/relationships.tmdl" --type relationship
-# python dedupe_columns.py "C:/path/to/folder" --type 3
+# python dedupe_columns.py "C:/path/to/relationships.tmdl" --type 3
 # python dedupe_columns.py "C:/path/to/folder" --type 4
