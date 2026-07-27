@@ -4,8 +4,8 @@ Duplicate Column Resolver for Power BI PBIP / TMDL files.
 Scans files sequentially for duplicate column definitions, extracts and compares
 their lineageTag / sourceLineageTag values, computes and ANSI-color highlights exact line/property
 differences between options, queries Git history (git show HEAD) if conflict markers were
-already removed (e.g. after accepting both changes), displays Incoming Change ALWAYS on top (Option 1)
-and Current Change (HEAD) on bottom (Option 2), tracks remaining duplicate counts per-file and total
+already removed (e.g. after accepting both changes), GUARANTEES Incoming Change is ALWAYS Option 1 (on top)
+and Current Change (HEAD) is ALWAYS Option 2 (on bottom), tracks remaining duplicate counts per-file and total
 across all files, and prompts the user to select which definition to keep (or skip).
 """
 
@@ -120,7 +120,7 @@ def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]
 
 def sort_blocks_incoming_first(col_blocks: List[ColumnBlock]) -> List[ColumnBlock]:
     """
-    Ensures Incoming Change comes first (Option 1 on top) and Current Branch (HEAD) comes second (Option 2 on bottom).
+    Guarantees Incoming Change is ALWAYS Option 1 (on top) and Current Branch (HEAD) is ALWAYS Option 2 (on bottom).
     """
     if len(col_blocks) != 2:
         return col_blocks
@@ -201,28 +201,44 @@ def format_block_with_diff_highlights(block: ColumnBlock, diff_indices: Set[int]
 def get_git_head_content(file_path: Path) -> Optional[str]:
     """
     Attempts to retrieve the content of file_path from Git HEAD (or ORIG_HEAD)
-    using git CLI commands.
+    using git CLI commands with case-insensitive Windows path resolution.
     """
     try:
+        abs_path = file_path.resolve()
         repo_root_cmd = ["git", "rev-parse", "--show-toplevel"]
         res = subprocess.run(
             repo_root_cmd,
-            cwd=file_path.parent if file_path.is_file() else file_path,
+            cwd=abs_path.parent if abs_path.is_file() else abs_path,
             capture_output=True,
             text=True,
             timeout=5
         )
         if res.returncode != 0:
             return None
-        repo_root = Path(res.stdout.strip())
+        repo_root = Path(res.stdout.strip()).resolve()
 
-        rel_path = file_path.resolve().relative_to(repo_root.resolve()).as_posix()
+        abs_path_str = str(abs_path)
+        repo_root_str = str(repo_root)
+
+        # Normalize Windows drive letter casing (e.g. c: vs C:)
+        if len(abs_path_str) >= 2 and abs_path_str[1] == ":":
+            abs_path_str = abs_path_str[0].upper() + abs_path_str[1:]
+        if len(repo_root_str) >= 2 and repo_root_str[1] == ":":
+            repo_root_str = repo_root_str[0].upper() + repo_root_str[1:]
+
+        abs_path_norm = Path(abs_path_str)
+        repo_root_norm = Path(repo_root_str)
+
+        try:
+            rel_path = abs_path_norm.relative_to(repo_root_norm).as_posix()
+        except ValueError:
+            rel_path = os.path.relpath(abs_path_norm, repo_root_norm).replace("\\", "/")
 
         for ref in ("HEAD", "ORIG_HEAD", "MERGE_HEAD"):
             git_show_cmd = ["git", "show", f"{ref}:{rel_path}"]
             res_show = subprocess.run(
                 git_show_cmd,
-                cwd=repo_root,
+                cwd=repo_root_norm,
                 capture_output=True,
                 text=True,
                 timeout=5
@@ -262,15 +278,18 @@ def check_git_origin_for_blocks(
     for blk in col_blocks:
         lt, slt = extract_lineage_tags(blk.lines)
         if (head_lt and lt == head_lt) or (head_slt and slt == head_slt):
+            blk.git_side = "CURRENT"
             blk.git_label = "Current Branch (HEAD)"
             matched_head = True
         elif head_lt is None and head_slt is None and "".join(blk.lines).strip() == "".join(head_cols[0].lines).strip():
+            blk.git_side = "CURRENT"
             blk.git_label = "Current Branch (HEAD)"
             matched_head = True
 
     if matched_head:
         for blk in col_blocks:
             if blk.git_label is None:
+                blk.git_side = "INCOMING"
                 blk.git_label = "Incoming Change (feature branch)"
 
 
