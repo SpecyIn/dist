@@ -9,7 +9,10 @@ Capabilities:
 1. Mode 1: Resolve Git Conflict Markers (<<<<<<<, =======, >>>>>>>).
    - Option 1: LineageTags (lineageTag, sourceLineageTag)
    - Option 2: SchemaTags ($schema: "https://...")
-   - Option 3: Bookmark / Object Name IDs ("name": "<hex-hash>") with Optional Cross-Reference Propagation
+   - Option 3: Bookmark / Object Name IDs ("name": "<hex-hash>")
+     - Same Content + Different Name: Resolves bookmark ID cleanly.
+     - Different Content + Different Name: Detects content divergence, warns user, and offers Option 1 (Incoming), Option 2 (Current), or Skip (leave untouched).
+     - Optional Cross-Reference Propagation.
    - Option 4: All Conflict Markers (LineageTags, SchemaTags, Bookmark IDs & All Other Conflicts)
    - Pure vs Mixed Conflict Detection: Detects whether a conflict block contains ONLY target properties or mixed changes.
    - Partial Fix Options (1P / 2P): Resolves ONLY the target property line while preserving Git conflict markers around visual/expression changes!
@@ -223,6 +226,23 @@ def is_pure_property_conflict(conflict: ConflictMarkerBlock, tag_filter: str) ->
         return all(BOOKMARK_ID_PATTERN.match(l) for l in all_lines)
 
     return True
+
+
+def is_bookmark_content_same(conflict: ConflictMarkerBlock) -> bool:
+    """
+    Checks if non-name content inside head_lines and incoming_lines is identical.
+    Ignores whitespace, trailing commas, and "name" property lines.
+    """
+    head_content_lines = [
+        l.strip().rstrip(",") for l in conflict.head_lines
+        if l.strip() and not BOOKMARK_ID_PATTERN.match(l)
+    ]
+    incoming_content_lines = [
+        l.strip().rstrip(",") for l in conflict.incoming_lines
+        if l.strip() and not BOOKMARK_ID_PATTERN.match(l)
+    ]
+
+    return head_content_lines == incoming_content_lines
 
 
 def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -821,6 +841,7 @@ def run_mode_1_conflict_markers(
     """
     Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) filtered by conflict_target_type.
     Performs global cross-reference hash propagation ONLY if propagate_refs is True.
+    Detects when bookmark name is different AND content is also different, prompting user to keep Incoming, Current, or Skip.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
@@ -864,9 +885,13 @@ def run_mode_1_conflict_markers(
         for c_idx, conflict in enumerate(conflicts, 1):
             stats.conflicts_found += 1
             is_pure = is_pure_property_conflict(conflict, conflict_target_type)
+            same_bookmark_content = is_bookmark_content_same(conflict) if conflict_target_type == "bookmark" else True
 
             print("\n" + CLR_BOLD + f"Conflict {c_idx} of {num_conflicts} (Lines {conflict.start_line + 1}-{conflict.end_line + 1}):" + CLR_RESET)
-            if not is_pure:
+            
+            if conflict_target_type == "bookmark" and not same_bookmark_content:
+                print(f"{CLR_RED}  [!] BOOKMARK DIVERGENCE DETECTED: Name is DIFFERENT AND Content/Properties are ALSO DIFFERENT!{CLR_RESET}")
+            elif not is_pure:
                 print(f"{CLR_YELLOW}  [!] MIXED CONFLICT: Block contains {conflict_target_type.upper()} AND other code/visual changes!{CLR_RESET}")
 
             print(f"  Option [1] [{conflict.incoming_label}] (Top):")
@@ -876,7 +901,7 @@ def run_mode_1_conflict_markers(
             for l in conflict.head_lines:
                 print(f"      {CLR_RED}{l.rstrip()}{CLR_RESET}")
 
-            selected_option = None  # "1", "2", "1P", "2P"
+            selected_option = None  # "1", "2", "1P", "2P", "s"
 
             if auto_keep_state[0] == "first":
                 selected_option = "1"
@@ -886,7 +911,16 @@ def run_mode_1_conflict_markers(
                 print("  [AUTO-KEEP 2A] Selected Option 2 (Current Branch)")
             else:
                 while True:
-                    if is_pure:
+                    if conflict_target_type == "bookmark" and not same_bookmark_content:
+                        prompt_msg = (
+                            f"Select option for DIFFERENT-CONTENT Bookmark conflict:\n"
+                            "  1  = Accept Option 1 [Incoming Change Bookmark]\n"
+                            "  2  = Accept Option 2 [Current Branch Bookmark]\n"
+                            "  1A = Accept Option 1 for ALL remaining conflicts\n"
+                            "  2A = Accept Option 2 for ALL remaining conflicts\n"
+                            "  s  = Skip (Do NOT touch, leave conflict untouched for manual review): "
+                        )
+                    elif is_pure:
                         prompt_msg = (
                             f"Select option to KEEP for this {conflict_target_type.upper()} conflict marker:\n"
                             "  (1 = Keep Option 1 [Incoming], 2 = Keep Option 2 [Current], 1A = Keep Option 1 for ALL, 2A = Keep Option 2 for ALL, s = skip): "
@@ -905,8 +939,9 @@ def run_mode_1_conflict_markers(
 
                     choice = input(prompt_msg).strip().lower()
                     if choice in ("s", "skip"):
-                        print("Skipped conflict block.")
+                        print(f"{CLR_YELLOW}Skipped conflict block (left untouched).{CLR_RESET}")
                         stats.conflicts_skipped += 1
+                        selected_option = "s"
                         break
                     elif choice == "1":
                         selected_option = "1"
@@ -931,6 +966,9 @@ def run_mode_1_conflict_markers(
                         print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 2 [Current Branch] for remaining {conflict_target_type.upper()} conflicts.{CLR_RESET}")
                         break
                     print("Invalid choice. Please enter a valid option.")
+
+            if selected_option == "s":
+                continue
 
             if selected_option in ("1", "2"):
                 stats.conflicts_resolved += 1
@@ -1553,4 +1591,4 @@ if __name__ == "__main__":
 
 # Example usage:
 # python PBIP-ConflictsResolve.py
-# python PBIP-ConflictsResolve.py "C:/path/to/report" --mode 1 --conflict-type 3 --propagate-refs
+# python PBIP-ConflictsResolve.py "C:/path/to/report"
