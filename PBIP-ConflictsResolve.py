@@ -9,7 +9,7 @@ Capabilities:
 1. Mode 1: Resolve Git Conflict Markers (<<<<<<<, =======, >>>>>>>).
    - Option 1: LineageTags (lineageTag, sourceLineageTag)
    - Option 2: SchemaTags ($schema: "https://...")
-   - Option 3: Bookmark / Object Name IDs ("name": "<hex-hash>") with Cross-Reference Propagation
+   - Option 3: Bookmark / Object Name IDs ("name": "<hex-hash>") with Optional Cross-Reference Propagation
    - Option 4: All Conflict Markers (LineageTags, SchemaTags, Bookmark IDs & All Other Conflicts)
    - Pure vs Mixed Conflict Detection: Detects whether a conflict block contains ONLY target properties or mixed changes.
    - Partial Fix Options (1P / 2P): Resolves ONLY the target property line while preserving Git conflict markers around visual/expression changes!
@@ -18,7 +18,7 @@ Capabilities:
 4. Mode 4: Power BI PBIP Metadata Health & Diagnostic Check (Scans for all remaining issues).
 
 Features:
-- Global Cross-Reference Propagation: Automatically updates references of discarded Bookmark / Object ID hashes across all project files.
+- Performance-Optimized Cross-Reference Propagation: Cross-reference propagation for Bookmark/Object ID hashes is OPTIONAL (default: disabled for maximum speed; prompt or --propagate-refs enables it).
 - Scoped Auto-Resolve (1A / 2A): '1A' or '2A' applies strictly to the currently selected property filter/category.
 - Interactive Navigation Loop: Returns to the Main Menu after completing tasks.
 - Reverse Relationship Duplicate Detection (fromA->toB vs fromB->toA).
@@ -728,6 +728,26 @@ def should_process_file(file_path: Path, extensions: Optional[Set[str]]) -> bool
     return ext in extensions
 
 
+def ask_propagate_cross_references(args_propagate: Optional[bool] = None) -> bool:
+    """
+    Prompts user whether to enable Global Cross-Reference Propagation.
+    Returns True if enabled, False if disabled (for maximum speed).
+    """
+    if args_propagate is not None:
+        return args_propagate
+
+    print("\nEnable Global Cross-Reference Propagation across all project files?")
+    print(" y - Yes, scan & update cross-references of discarded IDs across all files")
+    print(" n - No, resolve conflict lines only (FASTER performance, default)")
+    while True:
+        choice = input("Enter choice (y/n, default: n): ").strip().lower()
+        if choice in ("n", "no", ""):
+            return False
+        elif choice in ("y", "yes"):
+            return True
+        print("Invalid input. Please enter 'y' or 'n'.\n")
+
+
 def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
     """
     Returns normalized conflict marker target filter: 'lineage', 'schema', 'bookmark', or 'all'.
@@ -796,14 +816,17 @@ def get_target_object_type(args_type: Optional[str]) -> str:
 
 
 def run_mode_1_conflict_markers(
-    target_files: List[Path], conflict_target_type: str, dry_run: bool, auto_keep_state: List[Optional[str]], stats: SummaryStats
+    target_files: List[Path], conflict_target_type: str, dry_run: bool, auto_keep_state: List[Optional[str]], stats: SummaryStats, propagate_refs: bool = False
 ) -> None:
     """
     Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) filtered by conflict_target_type.
-    Performs global cross-reference hash propagation for Bookmark / Object ID hash replacements.
+    Performs global cross-reference hash propagation ONLY if propagate_refs is True.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
+    if conflict_target_type in ("bookmark", "all"):
+        prop_desc = "ENABLED" if propagate_refs else "DISABLED (FAST MODE)"
+        print(f"  • Cross-Reference Propagation: {CLR_YELLOW}{prop_desc}{CLR_RESET}")
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
 
     for file_idx, file_path in enumerate(target_files, 1):
@@ -921,8 +944,8 @@ def run_mode_1_conflict_markers(
                     if un_line in unselected and conflict.start_line < un_idx < conflict.end_line:
                         lines_to_delete.add(un_idx)
 
-                # Extract and propagate hash replacement across all project files if resolving Bookmark / Object ID conflict
-                if conflict_target_type == "bookmark" or (conflict_target_type == "all" and is_pure):
+                # Extract and propagate hash replacement ONLY if propagate_refs is True
+                if propagate_refs and (conflict_target_type == "bookmark" or (conflict_target_type == "all" and is_pure)):
                     kept_hash = None
                     discarded_hash = None
 
@@ -1364,8 +1387,12 @@ def run_single_execution(target_path: Path, mode: str, args) -> None:
 
     if mode in ("1", "3"):
         conflict_target_type = get_conflict_target_type(args.conflict_type)
+        propagate_refs = False
+        if conflict_target_type in ("bookmark", "all"):
+            propagate_refs = ask_propagate_cross_references(args.propagate_refs if hasattr(args, "propagate_refs") and args.propagate_refs else None)
+
         auto_keep_m1 = [initial_auto_keep]
-        run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_m1, stats)
+        run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_m1, stats, propagate_refs=propagate_refs)
 
     if mode in ("2", "3"):
         target_object_type = get_target_object_type(args.type)
@@ -1409,6 +1436,11 @@ def main() -> None:
         "--type",
         choices=["1", "2", "3", "4", "column", "expression", "relationship", "all"],
         help="Target object type for Mode 2 deduplication: 1/column, 2/expression, 3/relationship, 4/all.",
+    )
+    parser.add_argument(
+        "--propagate-refs",
+        action="store_true",
+        help="Enable global cross-reference propagation across all project files for Bookmark/Object ID replacements.",
     )
     parser.add_argument(
         "--dry-run",
@@ -1468,8 +1500,12 @@ def main() -> None:
             run_mode_4_metadata_diagnostic(target_files)
         elif mode == "1":
             conflict_target_type = get_conflict_target_type(args.conflict_type)
+            propagate_refs = False
+            if conflict_target_type in ("bookmark", "all"):
+                propagate_refs = ask_propagate_cross_references(args.propagate_refs if hasattr(args, "propagate_refs") and args.propagate_refs else None)
+
             auto_keep_m1 = [initial_auto_keep]
-            run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_m1, stats)
+            run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_m1, stats, propagate_refs=propagate_refs)
             print("\n--- Summary ---")
             print(f"Files scanned: {stats.files_scanned} | Modified: {stats.files_modified}")
             print(f"Conflict markers found: {stats.conflicts_found} | Resolved: {stats.conflicts_resolved} | Skipped: {stats.conflicts_skipped}")
@@ -1482,8 +1518,12 @@ def main() -> None:
             print(f"Duplicates found: {stats.duplicates_found} | Resolved: {stats.duplicates_resolved} | Skipped: {stats.duplicates_skipped}")
         elif mode == "3":
             conflict_target_type = get_conflict_target_type(args.conflict_type)
+            propagate_refs = False
+            if conflict_target_type in ("bookmark", "all"):
+                propagate_refs = ask_propagate_cross_references(args.propagate_refs if hasattr(args, "propagate_refs") and args.propagate_refs else None)
+
             auto_keep_m1 = [initial_auto_keep]
-            run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_m1, stats)
+            run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_m1, stats, propagate_refs=propagate_refs)
 
             target_object_type = get_target_object_type(args.type)
             auto_keep_m2 = [initial_auto_keep]
@@ -1513,4 +1553,4 @@ if __name__ == "__main__":
 
 # Example usage:
 # python PBIP-ConflictsResolve.py
-# python PBIP-ConflictsResolve.py "C:/path/to/report"
+# python PBIP-ConflictsResolve.py "C:/path/to/report" --mode 1 --conflict-type 3 --propagate-refs
