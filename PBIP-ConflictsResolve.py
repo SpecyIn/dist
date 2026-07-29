@@ -3,25 +3,28 @@
 Power BI PBIP All-in-One Conflict, Duplicate & Health Resolver (PBIP-ConflictsResolve.py).
 
 Combines Git Conflict Marker resolution, Duplicate Object deduplication, and Metadata Diagnostic Check
-into a single, self-contained Python script.
+into a single, self-contained Python script with interactive main menu navigation and category-scoped auto-resolving.
 
 Capabilities:
 1. Mode 1: Resolve Git Conflict Markers (<<<<<<<, =======, >>>>>>>).
    - Option 1: LineageTags (lineageTag, sourceLineageTag)
    - Option 2: SchemaTags ($schema: "https://...")
    - Option 3: All Conflict Markers (LineageTags, SchemaTags & All Other Conflicts)
+   - Pure vs Mixed Conflict Detection: Detects whether a conflict block contains ONLY target properties or mixed changes (visuals/expressions).
+   - Partial Fix Options (1P / 2P): Resolves ONLY the lineageTag / $schema line while preserving Git conflict markers around visual/expression changes!
 2. Mode 2: Deduplicate Objects (Columns, Expressions, Relationships) when conflict markers are absent (e.g. Accept Both Changes).
 3. Mode 3: Full Combo Mode (Run Mode 1 then Mode 2 sequentially).
 4. Mode 4: Power BI PBIP Metadata Health & Diagnostic Check (Scans for all remaining issues).
 
 Features:
+- Scoped Auto-Resolve (1A / 2A): '1A' or '2A' applies strictly to the currently selected property filter/category.
+- Interactive Navigation Loop: Returns to the Main Menu after completing tasks.
 - Reverse Relationship Duplicate Detection (fromA->toB vs fromB->toA).
 - Column Reference Normalization (strips quotes & extra spaces).
 - Automatic Blank Line Cleanup: Collapses multiple consecutive empty lines resulting from deleted blocks.
 - ANSI Color Highlighting and Diff Summaries.
 - Case-insensitive Windows Path Resolution & Git History Lookup (git show HEAD).
 - Guaranteed Option Ordering: Option [1] is ALWAYS Incoming Change; Option [2] is ALWAYS Current Branch (HEAD).
-- Shortcut options '1A' (auto-keep Incoming Change for all remaining) and '2A' (auto-keep Current Branch for all remaining).
 - Standalone Python 3 script using standard library only.
 """
 
@@ -194,6 +197,22 @@ def get_canonical_relationship_key(from_col: str, to_col: str) -> Tuple[str, str
     norm_from = normalize_column_ref(from_col)
     norm_to = normalize_column_ref(to_col)
     return tuple(sorted([norm_from, norm_to]))
+
+
+def is_pure_property_conflict(conflict: ConflictMarkerBlock, tag_filter: str) -> bool:
+    """
+    Checks if a conflict block contains ONLY the target property line(s) and no other code/visual changes.
+    """
+    all_lines = [l.strip() for l in conflict.head_lines + conflict.incoming_lines if l.strip()]
+    if not all_lines:
+        return True
+
+    if tag_filter == "lineage":
+        return all(TAG_PATTERN.match(l) for l in all_lines)
+    elif tag_filter == "schema":
+        return all(SCHEMA_PATTERN.match(l) for l in all_lines)
+
+    return True
 
 
 def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -729,6 +748,8 @@ def run_mode_1_conflict_markers(
 ) -> None:
     """
     Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) filtered by conflict_target_type.
+    Detects pure vs mixed conflicts and supports Partial Fix (1P / 2P) to isolate property lines
+    without destroying visual/expression changes.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
@@ -762,14 +783,18 @@ def run_mode_1_conflict_markers(
         stats.files_scanned += 1
         num_conflicts = len(conflicts)
         lines_to_delete: Set[int] = set()
+        partial_insertions: Dict[int, List[str]] = {}
 
         print(f"\nFile [{file_idx}/{len(target_files)}]: {file_path} - Found {num_conflicts} conflict marker(s).")
 
         for c_idx, conflict in enumerate(conflicts, 1):
             stats.conflicts_found += 1
-            selected_lines: Optional[List[str]] = None
+            is_pure = is_pure_property_conflict(conflict, conflict_target_type)
 
             print("\n" + CLR_BOLD + f"Conflict {c_idx} of {num_conflicts} (Lines {conflict.start_line + 1}-{conflict.end_line + 1}):" + CLR_RESET)
+            if not is_pure:
+                print(f"{CLR_YELLOW}  [!] MIXED CONFLICT: Block contains {conflict_target_type.upper()} AND other code/visual changes!{CLR_RESET}")
+
             print(f"  Option [1] [{conflict.incoming_label}] (Top):")
             for l in conflict.incoming_lines:
                 print(f"      {CLR_GREEN}{l.rstrip()}{CLR_RESET}")
@@ -777,54 +802,103 @@ def run_mode_1_conflict_markers(
             for l in conflict.head_lines:
                 print(f"      {CLR_RED}{l.rstrip()}{CLR_RESET}")
 
+            selected_option = None  # "1", "2", "1P", "2P"
+
             if auto_keep_state[0] == "first":
-                selected_lines = conflict.incoming_lines
+                selected_option = "1"
                 print("  [AUTO-KEEP 1A] Selected Option 1 (Incoming Change)")
             elif auto_keep_state[0] == "last":
-                selected_lines = conflict.head_lines
+                selected_option = "2"
                 print("  [AUTO-KEEP 2A] Selected Option 2 (Current Branch)")
             else:
                 while True:
-                    prompt_msg = (
-                        "Select option to KEEP for this conflict marker:\n"
-                        "  (1 = Keep Option 1 [Incoming], 2 = Keep Option 2 [Current], 1A = Keep Option 1 for ALL, 2A = Keep Option 2 for ALL, s = skip): "
-                    )
+                    if is_pure:
+                        prompt_msg = (
+                            f"Select option to KEEP for this {conflict_target_type.upper()} conflict marker:\n"
+                            "  (1 = Keep Option 1 [Incoming], 2 = Keep Option 2 [Current], 1A = Keep Option 1 for ALL, 2A = Keep Option 2 for ALL, s = skip): "
+                        )
+                    else:
+                        prompt_msg = (
+                            f"Select option to KEEP for this MIXED conflict marker:\n"
+                            "  1  = Full Option 1 [Incoming Change]\n"
+                            "  2  = Full Option 2 [Current Branch]\n"
+                            "  1P = Partial Fix: Update tag to Option 1 [Incoming], KEEP conflict markers for visual/other changes\n"
+                            "  2P = Partial Fix: Update tag to Option 2 [Current], KEEP conflict markers for visual/other changes\n"
+                            "  1A = Full Option 1 for ALL remaining conflicts\n"
+                            "  2A = Full Option 2 for ALL remaining conflicts\n"
+                            "  s  = Skip: "
+                        )
+
                     choice = input(prompt_msg).strip().lower()
                     if choice in ("s", "skip"):
                         print("Skipped conflict block.")
                         stats.conflicts_skipped += 1
                         break
                     elif choice == "1":
-                        selected_lines = conflict.incoming_lines
+                        selected_option = "1"
                         break
                     elif choice == "2":
-                        selected_lines = conflict.head_lines
+                        selected_option = "2"
+                        break
+                    elif choice in ("1p", "p1") and not is_pure:
+                        selected_option = "1P"
+                        break
+                    elif choice in ("2p", "p2") and not is_pure:
+                        selected_option = "2P"
                         break
                     elif choice in ("1a", "a1", "all1"):
-                        selected_lines = conflict.incoming_lines
+                        selected_option = "1"
                         auto_keep_state[0] = "first"
-                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 1 [Incoming Change] for all remaining conflict markers.{CLR_RESET}")
+                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 1 [Incoming Change] for remaining {conflict_target_type.upper()} conflicts.{CLR_RESET}")
                         break
                     elif choice in ("2a", "a2", "all2"):
-                        selected_lines = conflict.head_lines
+                        selected_option = "2"
                         auto_keep_state[0] = "last"
-                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 2 [Current Branch] for all remaining conflict markers.{CLR_RESET}")
+                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 2 [Current Branch] for remaining {conflict_target_type.upper()} conflicts.{CLR_RESET}")
                         break
-                    print("Invalid choice. Enter 1, 2, 1A, 2A, or 's'.")
+                    print("Invalid choice. Please enter a valid option.")
 
-            if selected_lines is not None:
+            if selected_option in ("1", "2"):
                 stats.conflicts_resolved += 1
                 lines_to_delete.add(conflict.start_line)
                 lines_to_delete.add(conflict.sep_line)
                 lines_to_delete.add(conflict.end_line)
-                unselected = conflict.head_lines if selected_lines == conflict.incoming_lines else conflict.incoming_lines
+                selected_lines = conflict.incoming_lines if selected_option == "1" else conflict.head_lines
+                unselected = conflict.head_lines if selected_option == "1" else conflict.incoming_lines
                 for un_idx, un_line in enumerate(lines):
                     if un_line in unselected and conflict.start_line < un_idx < conflict.end_line:
                         lines_to_delete.add(un_idx)
 
-        if lines_to_delete and not dry_run:
+            elif selected_option in ("1P", "2P"):
+                stats.conflicts_resolved += 1
+                source_lines = conflict.incoming_lines if selected_option == "1P" else conflict.head_lines
+
+                extracted_tag_line = None
+                pat = TAG_PATTERN if conflict_target_type == "lineage" else SCHEMA_PATTERN
+                for l in source_lines:
+                    if pat.match(l):
+                        extracted_tag_line = l
+                        break
+
+                if extracted_tag_line:
+                    # Place extracted property line directly ABOVE the remaining conflict block
+                    partial_insertions[conflict.start_line] = [extracted_tag_line]
+
+                    # Remove tag lines from inside both head_lines and incoming_lines
+                    for idx in range(conflict.start_line + 1, conflict.end_line):
+                        if pat.match(lines[idx]):
+                            lines_to_delete.add(idx)
+                    print(f"{CLR_GREEN}--> Partial Fix Applied: Updated tag line and preserved visual conflict markers.{CLR_RESET}")
+
+        if (lines_to_delete or partial_insertions) and not dry_run:
             stats.files_modified += 1
-            new_lines = [l for idx, l in enumerate(lines) if idx not in lines_to_delete]
+            new_lines = []
+            for idx, l in enumerate(lines):
+                if idx in partial_insertions:
+                    new_lines.extend(partial_insertions[idx])
+                if idx not in lines_to_delete:
+                    new_lines.append(l)
+
             cleaned_lines = cleanup_excessive_blank_lines(new_lines)
             new_content = "".join(cleaned_lines)
             encoded = new_content.encode("utf-8")
@@ -840,6 +914,7 @@ def run_mode_2_dedupe_objects(
 ) -> None:
     """
     Mode 2: Deduplicates Objects (Columns, Expressions, Relationships) when conflict markers are absent.
+    auto_keep_state is scoped locally to this object type run.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 2: Resolving Duplicate Objects (Target: {target_object_type.upper()})" + CLR_RESET)
@@ -1096,7 +1171,7 @@ def process_file_task(
             while True:
                 prompt_msg = (
                     f"Select option to KEEP for {obj_type} '{col_display_name}'\n"
-                    f"  (1 = Keep Option 1, 2 = Keep Option 2, 1A = Keep Option 1 for ALL, 2A = Keep Option 2 for ALL, s = skip): "
+                    f"  (1 = Keep Option 1, 2 = Keep Option 2, 1A = Keep Option 1 for ALL {obj_type.upper()}S, 2A = Keep Option 2 for ALL {obj_type.upper()}S, s = skip): "
                 )
                 choice = input(prompt_msg).strip().lower()
 
@@ -1113,12 +1188,12 @@ def process_file_task(
                 elif choice in ("1a", "a1", "all1"):
                     selected_idx = 0
                     auto_keep_state[0] = "first"
-                    print(f"\n{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 1 [Incoming Change] for all remaining duplicates.{CLR_RESET}")
+                    print(f"\n{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 1 [Incoming Change] for remaining {obj_type.upper()} duplicates.{CLR_RESET}")
                     break
                 elif choice in ("2a", "a2", "all2"):
                     selected_idx = num_options - 1
                     auto_keep_state[0] = "last"
-                    print(f"\n{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 2 [Current Branch] for all remaining duplicates.{CLR_RESET}")
+                    print(f"\n{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 2 [Current Branch] for remaining {obj_type.upper()} duplicates.{CLR_RESET}")
                     break
                 elif choice.isdigit():
                     val = int(choice)
@@ -1189,6 +1264,57 @@ def get_action_mode(args_mode: Optional[str]) -> str:
         print("Invalid input. Please enter 1, 2, 3, or 4.\n")
 
 
+def collect_target_files(target_path: Path, extensions_set: Optional[Set[str]]) -> List[Path]:
+    """Collects all matching target files under target_path."""
+    target_files: List[Path] = []
+    if target_path.is_file():
+        target_files.append(target_path)
+    elif target_path.is_dir():
+        for root, _, files in os.walk(target_path):
+            for file in files:
+                file_path = Path(root) / file
+                if should_process_file(file_path, extensions_set):
+                    target_files.append(file_path)
+    return target_files
+
+
+def run_single_execution(target_path: Path, mode: str, args) -> None:
+    """Executes a single mode run (used for CLI flag execution)."""
+    ext_arg = None if args.extensions and args.extensions.lower() == "all" else args.extensions
+    extensions_set = parse_extensions(ext_arg)
+    target_files = collect_target_files(target_path, extensions_set)
+
+    initial_auto_keep = "first" if args.keep_first else "last" if args.keep_last else None
+    stats = SummaryStats()
+
+    if mode == "4":
+        run_mode_4_metadata_diagnostic(target_files)
+        return
+
+    if mode in ("1", "3"):
+        conflict_target_type = get_conflict_target_type(args.conflict_type)
+        auto_keep_m1 = [initial_auto_keep]
+        run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_m1, stats)
+
+    if mode in ("2", "3"):
+        target_object_type = get_target_object_type(args.type)
+        auto_keep_m2 = [initial_auto_keep]
+        run_mode_2_dedupe_objects(target_files, target_object_type, args.dry_run, auto_keep_m2, stats)
+
+    print("\n--- Final Summary ---")
+    print(f"Files scanned: {stats.files_scanned}")
+    print(f"Files modified: {stats.files_modified}")
+    if mode in ("1", "3"):
+        print(f"Conflict markers found: {stats.conflicts_found}")
+        print(f"Conflict markers resolved: {stats.conflicts_resolved}")
+        print(f"Conflict markers skipped: {stats.conflicts_skipped}")
+    if mode in ("2", "3"):
+        print(f"Duplicate object groups found: {stats.duplicates_found}")
+        print(f"Duplicate object groups resolved: {stats.duplicates_resolved}")
+        print(f"Duplicate object groups skipped: {stats.duplicates_skipped}")
+    print(f"Files skipped (binary/non-utf8): {stats.files_skipped}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Master Power BI PBIP Conflict & Duplicate Resolver (PBIP-ConflictsResolve.py)."
@@ -1251,58 +1377,63 @@ def main() -> None:
         print(f"Error: Path '{path_str}' does not exist.", file=sys.stderr)
         sys.exit(1)
 
-    mode = get_action_mode(args.mode)
+    # If --mode was explicitly passed as CLI flag, run once and exit
+    if args.mode:
+        mode = get_action_mode(args.mode)
+        run_single_execution(target_path, mode, args)
+        return
 
+    # Interactive Navigation Loop
     ext_arg = None if args.extensions and args.extensions.lower() == "all" else args.extensions
     extensions_set = parse_extensions(ext_arg)
 
-    initial_auto_keep = None
-    if args.keep_first:
-        initial_auto_keep = "first"
-    elif args.keep_last:
-        initial_auto_keep = "last"
+    while True:
+        mode = get_action_mode(None)
+        target_files = collect_target_files(target_path, extensions_set)
+        initial_auto_keep = "first" if args.keep_first else "last" if args.keep_last else None
+        stats = SummaryStats()
 
-    auto_keep_state = [initial_auto_keep]
+        if mode == "4":
+            run_mode_4_metadata_diagnostic(target_files)
+        elif mode == "1":
+            conflict_target_type = get_conflict_target_type(args.conflict_type)
+            auto_keep_m1 = [initial_auto_keep]
+            run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_m1, stats)
+            print("\n--- Summary ---")
+            print(f"Files scanned: {stats.files_scanned} | Modified: {stats.files_modified}")
+            print(f"Conflict markers found: {stats.conflicts_found} | Resolved: {stats.conflicts_resolved} | Skipped: {stats.conflicts_skipped}")
+        elif mode == "2":
+            target_object_type = get_target_object_type(args.type)
+            auto_keep_m2 = [initial_auto_keep]
+            run_mode_2_dedupe_objects(target_files, target_object_type, args.dry_run, auto_keep_m2, stats)
+            print("\n--- Summary ---")
+            print(f"Files scanned: {stats.files_scanned} | Modified: {stats.files_modified}")
+            print(f"Duplicates found: {stats.duplicates_found} | Resolved: {stats.duplicates_resolved} | Skipped: {stats.duplicates_skipped}")
+        elif mode == "3":
+            conflict_target_type = get_conflict_target_type(args.conflict_type)
+            auto_keep_m1 = [initial_auto_keep]
+            run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_m1, stats)
 
-    stats = SummaryStats()
-    target_files: List[Path] = []
+            target_object_type = get_target_object_type(args.type)
+            auto_keep_m2 = [initial_auto_keep]
+            run_mode_2_dedupe_objects(target_files, target_object_type, args.dry_run, auto_keep_m2, stats)
+            print("\n--- Final Summary ---")
+            print(f"Files scanned: {stats.files_scanned} | Modified: {stats.files_modified}")
+            print(f"Conflict markers resolved: {stats.conflicts_resolved} | Duplicates resolved: {stats.duplicates_resolved}")
 
-    if target_path.is_file():
-        target_files.append(target_path)
-    elif target_path.is_dir():
-        for root, _, files in os.walk(target_path):
-            for file in files:
-                file_path = Path(root) / file
-                if should_process_file(file_path, extensions_set):
-                    target_files.append(file_path)
-    else:
-        print(f"Error: Path '{target_path}' is neither a file nor a directory.", file=sys.stderr)
-        sys.exit(1)
-
-    if mode == "4":
-        run_mode_4_metadata_diagnostic(target_files)
-        return
-
-    if mode in ("1", "3"):
-        conflict_target_type = get_conflict_target_type(args.conflict_type)
-        run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_state, stats)
-
-    if mode in ("2", "3"):
-        target_object_type = get_target_object_type(args.type)
-        run_mode_2_dedupe_objects(target_files, target_object_type, args.dry_run, auto_keep_state, stats)
-
-    print("\n--- Final Summary ---")
-    print(f"Files scanned: {stats.files_scanned}")
-    print(f"Files modified: {stats.files_modified}")
-    if mode in ("1", "3"):
-        print(f"Conflict markers found: {stats.conflicts_found}")
-        print(f"Conflict markers resolved: {stats.conflicts_resolved}")
-        print(f"Conflict markers skipped: {stats.conflicts_skipped}")
-    if mode in ("2", "3"):
-        print(f"Duplicate object groups found: {stats.duplicates_found}")
-        print(f"Duplicate object groups resolved: {stats.duplicates_resolved}")
-        print(f"Duplicate object groups skipped: {stats.duplicates_skipped}")
-    print(f"Files skipped (binary/non-utf8): {stats.files_skipped}")
+        # Sub-menu navigation return prompt
+        print("\n" + CLR_CYAN + "--------------------------------------------------------------------------------" + CLR_RESET)
+        print(CLR_BOLD + "Task completed. What would you like to do next?" + CLR_RESET)
+        print(" 1 - Return to Main Menu")
+        print(" 2 - Exit")
+        while True:
+            next_choice = input("Enter option (1 or 2): ").strip()
+            if next_choice == "1":
+                break
+            elif next_choice == "2":
+                print("\nExiting PBIP Resolver. Goodbye!")
+                sys.exit(0)
+            print("Invalid input. Please enter 1 or 2.")
 
 
 if __name__ == "__main__":
@@ -1311,4 +1442,4 @@ if __name__ == "__main__":
 
 # Example usage:
 # python PBIP-ConflictsResolve.py
-# python PBIP-ConflictsResolve.py "C:/path/to/report" --mode 4
+# python PBIP-ConflictsResolve.py "C:/path/to/report"
