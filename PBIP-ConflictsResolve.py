@@ -1,38 +1,47 @@
 #!/usr/bin/env python3
 """
-Power BI PBIP All-in-One Conflict, Duplicate & Health Resolver (PBIP-ConflictsResolve.py).
+Power BI PBIP All-in-One Conflict, Duplicate, Staging & Health Resolver (PBIP-ConflictsResolve.py).
 
-Combines Git Conflict Marker resolution, Duplicate Object deduplication, and Metadata Diagnostic Check
-into a single, self-contained Python script with interactive main menu navigation and category-scoped auto-resolving.
+Production-grade master script for automated and interactive Power BI PBIP / Fabric dataset management.
+Combines Git Conflict Marker resolution, Duplicate Object deduplication, Git Staging of Clean Files,
+Metadata Health Check, and Detailed Visual Conflict Diff Review into a single, zero-dependency Python script.
 
-Capabilities:
-1. Mode 1: Resolve Git Conflict Markers (<<<<<<<, =======, >>>>>>>).
-   - Option 1: LineageTags (lineageTag, sourceLineageTag)
-   - Option 2: LogicalIds (logicalId, sourceLogicalId in TMDL, JSON, & .platform files)
-   - Option 3: SchemaTags ($schema: "https://...")
-   - Option 4: Bookmark / Object Name IDs ("name": "<hex-hash>")
-     - Same Content + Different Name: Resolves bookmark ID cleanly.
-     - Different Content + Different Name: Detects content divergence, pauses 1A auto-keep, and ALWAYS prompts user to accept Option 1 (Incoming), Option 2 (Current), or Skip.
-     - Optional Cross-Reference Propagation.
-   - Option 5: All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs & All Other Conflicts)
-   - Pure vs Mixed Conflict Detection: Detects whether a conflict block contains ONLY target properties or mixed changes.
-   - Partial Fix Options (1P / 2P): Resolves ONLY the target property line while preserving Git conflict markers around visual/expression changes!
-2. Mode 2: Deduplicate Objects (Columns, Expressions, Relationships) when conflict markers are absent (e.g. Accept Both Changes).
-3. Mode 3: Full Combo Mode (Run Mode 1 then Mode 2 sequentially).
-4. Mode 4: Power BI PBIP Metadata Health & Diagnostic Check (Scans for all remaining issues).
+Modes & Capabilities:
+1. Mode 1: Git Conflict Marker Resolution (<<<<<<<, =======, >>>>>>>).
+   - Property Filters:
+     1 - LineageTags (lineageTag, sourceLineageTag in TMDL files)
+     2 - LogicalIds (logicalId, sourceLogicalId in TMDL, JSON, & .platform files)
+     3 - SchemaTags ($schema: "https://..." in PBIP JSON report files)
+     4 - Bookmark / Object Name IDs ("name": "<hex-hash>" in bookmarks.json, page.json, visual.json)
+     5 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs & All Other Conflicts)
+   - Features:
+     - Pure vs Mixed Conflict Detection: Detects single-line property vs mixed visual/expression changes.
+     - Partial Fix Options (1P / 2P): Resolves property lines while keeping conflict markers around visual changes.
+     - Bookmark Content Divergence Protection: Detects if bookmark content differs alongside ID, pausing 1A/2A auto-keep to prompt for safe manual choice.
+     - Performance-Optimized Optional Cross-Reference Propagation: Scans project files to update cross-references of replaced bookmark/object IDs.
+     - Bulletproof Index-Based Deletion: Immune to line ending (\r\n vs \n) or whitespace differences.
 
-Features:
-- Full Fabric & Power BI PBIP File Support: Includes .tmdl, .json, .pbir, .pbip, .platform, .fabric, .definition, .item, .report files.
-- Performance-Optimized Cross-Reference Propagation: Cross-reference propagation for Bookmark/Object ID hashes is OPTIONAL (default: disabled for maximum speed; prompt or --propagate-refs enables it).
-- Scoped Auto-Resolve (1A / 2A): '1A' or '2A' applies strictly to the currently selected property filter/category.
-- Interactive Navigation Loop: Returns to the Main Menu after completing tasks.
-- Reverse Relationship Duplicate Detection (fromA->toB vs fromB->toA).
-- Column Reference Normalization (strips quotes & extra spaces).
+2. Mode 2: Duplicate Object Resolution (when conflict markers are absent, e.g. after Accept Both Changes).
+   - Supports: 1 - Columns, 2 - Expressions, 3 - Relationships (with reverse pair canonical matching fromA->toB vs fromB->toA), 4 - All.
+   - Queries Git HEAD to track origin of duplicate definitions.
+
+3. Mode 3: Stage Clean Files to Git.
+   - Automatically executes 'git add' on all project files containing 0 remaining conflict markers.
+
+4. Mode 4: Power BI PBIP Metadata Health & Diagnostic Check.
+   - Complete health validation scanning for remaining Git conflict markers, duplicate TMDL objects, JSON syntax errors, and missing lineageTags with exact line numbers.
+
+5. Mode 5: Detailed Conflict Review & Visual Diff Viewer.
+   - Reviews remaining Git conflicts one-by-one with full line-by-line diff highlights (* <-- DIFFERENT).
+   - Option [1] is ALWAYS Incoming Change (Top), Option [2] is ALWAYS Current Branch / HEAD (Bottom).
+
+Features & Controls:
+- Scoped Auto-Resolve (1A / 2A): '1A' or '2A' applies strictly to the currently selected property filter or object category session.
+- Interactive Navigation Loop: Sub-menu prompt to return to the Main Menu after completing tasks.
+- Full Fabric & Power BI File Support: Scans .tmdl, .json, .pbir, .pbip, .platform, .fabric, .definition, .item, and .report files.
 - Automatic Blank Line Cleanup: Collapses multiple consecutive empty lines resulting from deleted blocks.
-- ANSI Color Highlighting and Diff Summaries.
-- Case-insensitive Windows Path Resolution & Git History Lookup (git show HEAD).
 - Guaranteed Option Ordering: Option [1] is ALWAYS Incoming Change; Option [2] is ALWAYS Current Branch (HEAD).
-- Standalone Python 3 script using standard library only.
+- Standard Library Only: Zero external dependencies required.
 """
 
 import argparse
@@ -121,43 +130,37 @@ class SummaryStats:
     files_skipped: int = 0
 
 
-# Regex to detect TMDL column, expression, measure, or relationship header line
+# Pre-compiled Regex Patterns for Maximum Execution Speed
 OBJECT_HEADER_PATTERN = re.compile(
     r'^(?P<indent>\s*)(?P<type>column|expression|measure|relationship)(?:\s+(?P<header>.+))?$',
     re.IGNORECASE
 )
 
-# Keywords that start a new object in TMDL at the same or lower indentation level
 OBJECT_KEYWORDS = re.compile(
     r'^\s*(?:column|expression|measure|relationship|partition|table|hierarchy|ref|role|perspective|culture)\b',
     re.IGNORECASE
 )
 
-# Regex to match lineageTag or sourceLineageTag property lines with optional quotes
 TAG_PATTERN = re.compile(
     r'^\s*["\']?(lineageTag|sourceLineageTag)["\']?\s*:\s*(.+)$',
     re.IGNORECASE
 )
 
-# Regex to match logicalId or sourceLogicalId property lines with optional quotes
 LOGICAL_ID_PATTERN = re.compile(
     r'^\s*["\']?(logicalId|sourceLogicalId)["\']?\s*:\s*(.+)$',
     re.IGNORECASE
 )
 
-# Regex to match $schema property lines with optional quotes
 SCHEMA_PATTERN = re.compile(
     r'^\s*["\']?\$schema["\']?\s*:\s*(.+)$',
     re.IGNORECASE
 )
 
-# Regex to match bookmark / object name ID hash lines (e.g. "name": "bfc96ab435b50ee1cd8d",)
 BOOKMARK_ID_PATTERN = re.compile(
     r'^\s*["\']?name["\']?\s*:\s*["\']([0-9a-fA-F]{8,64})["\']\s*,?\s*$',
     re.IGNORECASE
 )
 
-# Regex to match fromColumn and toColumn in relationships
 FROM_COL_PATTERN = re.compile(r'^\s*["\']?fromColumn["\']?\s*:\s*(.+)$', re.IGNORECASE)
 TO_COL_PATTERN = re.compile(r'^\s*["\']?toColumn["\']?\s*:\s*(.+)$', re.IGNORECASE)
 
@@ -306,60 +309,71 @@ def sort_blocks_incoming_first(col_blocks: List[ColumnBlock]) -> List[ColumnBloc
     return sorted(col_blocks, key=get_sort_key)
 
 
+def compute_line_differences(lines1: List[str], lines2: List[str]) -> Tuple[List[str], Set[int], Set[int]]:
+    """
+    Computes exact line differences between Option 1 (lines1) and Option 2 (lines2).
+    Returns:
+      diff_summary: list of formatted strings describing property diffs in color.
+      diff_set1: set of line indices in lines1 that differ.
+      diff_set2: set of line indices in lines2 that differ.
+    """
+    diff_summary: List[str] = []
+    diff_set1: Set[int] = set()
+    diff_set2: Set[int] = set()
+
+    clean1 = [l.strip() for l in lines1 if l.strip()]
+    clean2 = [l.strip() for l in lines2 if l.strip()]
+
+    matcher = difflib.SequenceMatcher(None, clean1, clean2)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'replace':
+            for a_idx, b_idx in zip(range(i1, i2), range(j1, j2)):
+                diff_summary.append(
+                    f"{CLR_RED}      - Option [1] (Incoming): {clean1[a_idx]}{CLR_RESET}\n"
+                    f"{CLR_GREEN}      + Option [2] (Current) : {clean2[b_idx]}{CLR_RESET}"
+                )
+        elif tag == 'delete':
+            for a_idx in range(i1, i2):
+                diff_summary.append(
+                    f"{CLR_RED}      - Option [1] (Incoming): {clean1[a_idx]}{CLR_RESET}\n"
+                    f"{CLR_GREEN}      + Option [2] (Current) : (missing in Option 2){CLR_RESET}"
+                )
+        elif tag == 'insert':
+            for b_idx in range(j1, j2):
+                diff_summary.append(
+                    f"{CLR_RED}      - Option [1] (Incoming): (missing in Option 1){CLR_RESET}\n"
+                    f"{CLR_GREEN}      + Option [2] (Current) : {clean2[b_idx]}{CLR_RESET}"
+                )
+
+    orig_matcher = difflib.SequenceMatcher(
+        None, [l.rstrip("\r\n").strip() for l in lines1], [l.rstrip("\r\n").strip() for l in lines2]
+    )
+    for tag, i1, i2, j1, j2 in orig_matcher.get_opcodes():
+        if tag != 'equal':
+            for idx in range(i1, i2):
+                diff_set1.add(idx)
+            for idx in range(j1, j2):
+                diff_set2.add(idx)
+
+    return diff_summary, diff_set1, diff_set2
+
+
 def compute_block_differences(col_blocks: List[ColumnBlock]) -> Tuple[List[str], List[Set[int]]]:
     """
     Computes exact property and line differences between duplicate object blocks.
-    Returns:
-      diff_summary: list of formatted strings describing property diffs in color.
-      differing_lines_per_block: list of sets containing line indices within each block that differ.
     """
-    diff_summary: List[str] = []
-    differing_lines_per_block: List[Set[int]] = [set() for _ in col_blocks]
-
     if len(col_blocks) >= 2:
-        lines1_clean = [l.strip() for l in col_blocks[0].lines if l.strip()]
-        lines2_clean = [l.strip() for l in col_blocks[1].lines if l.strip()]
-
-        matcher = difflib.SequenceMatcher(None, lines1_clean, lines2_clean)
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            if tag == 'replace':
-                for a_idx, b_idx in zip(range(i1, i2), range(j1, j2)):
-                    diff_summary.append(
-                        f"{CLR_RED}      - Option [1]: {lines1_clean[a_idx]}{CLR_RESET}\n"
-                        f"{CLR_GREEN}      + Option [2]: {lines2_clean[b_idx]}{CLR_RESET}"
-                    )
-            elif tag == 'delete':
-                for a_idx in range(i1, i2):
-                    diff_summary.append(
-                        f"{CLR_RED}      - Option [1]: {lines1_clean[a_idx]}{CLR_RESET}\n"
-                        f"{CLR_GREEN}      + Option [2]: (missing in Option 2){CLR_RESET}"
-                    )
-            elif tag == 'insert':
-                for b_idx in range(j1, j2):
-                    diff_summary.append(
-                        f"{CLR_RED}      - Option [1]: (missing in Option 1){CLR_RESET}\n"
-                        f"{CLR_GREEN}      + Option [2]: {lines2_clean[b_idx]}{CLR_RESET}"
-                    )
-
-        orig_lines1 = [l.rstrip("\r\n") for l in col_blocks[0].lines]
-        orig_lines2 = [l.rstrip("\r\n") for l in col_blocks[1].lines]
-        orig_matcher = difflib.SequenceMatcher(None, [l.strip() for l in orig_lines1], [l.strip() for l in orig_lines2])
-        for tag, i1, i2, j1, j2 in orig_matcher.get_opcodes():
-            if tag != 'equal':
-                for idx in range(i1, i2):
-                    differing_lines_per_block[0].add(idx)
-                for idx in range(j1, j2):
-                    differing_lines_per_block[1].add(idx)
-
-    return diff_summary, differing_lines_per_block
+        diff_sum, dset1, dset2 = compute_line_differences(col_blocks[0].lines, col_blocks[1].lines)
+        return diff_sum, [dset1, dset2]
+    return [], [set() for _ in col_blocks]
 
 
-def format_block_with_diff_highlights(block: ColumnBlock, diff_indices: Set[int]) -> str:
+def format_lines_with_diff_highlights(lines: List[str], diff_indices: Set[int]) -> str:
     """
-    Formats the lines of an object block, highlighting differing lines with ANSI color, '*' indicator, and tag.
+    Formats lines of code, highlighting differing lines with ANSI color, '*' indicator, and tag.
     """
     formatted_lines = []
-    for idx, line in enumerate(block.lines):
+    for idx, line in enumerate(lines):
         clean_line = line.rstrip("\r\n")
         if idx in diff_indices:
             formatted_lines.append(f"{CLR_YELLOW}  * {clean_line}   <-- DIFFERENT{CLR_RESET}")
@@ -993,15 +1007,21 @@ def run_mode_1_conflict_markers(
 
             if selected_option in ("1", "2"):
                 stats.conflicts_resolved += 1
-                lines_to_delete.add(conflict.start_line)
-                lines_to_delete.add(conflict.sep_line)
-                lines_to_delete.add(conflict.end_line)
+                lines_to_delete.add(conflict.start_line) # Delete <<<<<<<
+                lines_to_delete.add(conflict.sep_line)   # Delete =======
+                lines_to_delete.add(conflict.end_line)   # Delete >>>>>>>
+                
                 selected_lines = conflict.incoming_lines if selected_option == "1" else conflict.head_lines
                 unselected = conflict.head_lines if selected_option == "1" else conflict.incoming_lines
 
-                for un_idx, un_line in enumerate(lines):
-                    if un_line in unselected and conflict.start_line < un_idx < conflict.end_line:
-                        lines_to_delete.add(un_idx)
+                if selected_option == "1":
+                    # Keep Option 1 (Incoming): Delete all HEAD lines between start_line and sep_line
+                    for idx in range(conflict.start_line + 1, conflict.sep_line):
+                        lines_to_delete.add(idx)
+                elif selected_option == "2":
+                    # Keep Option 2 (Current): Delete all Incoming lines between sep_line and end_line
+                    for idx in range(conflict.sep_line + 1, conflict.end_line):
+                        lines_to_delete.add(idx)
 
                 # Extract and propagate hash replacement ONLY if propagate_refs is True
                 if propagate_refs and (conflict_target_type == "bookmark" or (conflict_target_type == "all" and is_pure)):
@@ -1089,6 +1109,74 @@ def run_mode_2_dedupe_objects(
         process_file_task(
             task, file_idx, total_files, dry_run, auto_keep_state, global_remaining, stats
         )
+
+
+def run_mode_3_stage_clean_files(target_files: List[Path], dry_run: bool) -> None:
+    """
+    Mode 3: Automatically runs 'git add' on all target files that have 0 remaining conflict markers.
+    """
+    print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
+    print(CLR_BOLD + "  MODE 3: Stage Clean Files to Git (0 Remaining Conflicts)" + CLR_RESET)
+    print(CLR_CYAN + "================================================================================" + CLR_RESET)
+
+    staged_files: List[Path] = []
+    conflict_files: List[Tuple[Path, int]] = []
+
+    for file_path in target_files:
+        try:
+            with open(file_path, "rb") as f:
+                chunk = f.read(8192)
+                if b"\x00" in chunk:
+                    continue
+                f.seek(0)
+                raw_bytes = f.read()
+        except Exception:
+            continue
+
+        has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
+        try:
+            content = (raw_bytes[3:] if has_bom else raw_bytes).decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+
+        lines = content.splitlines(keepends=True)
+        conflicts = parse_git_conflict_blocks(lines, tag_filter="all")
+
+        if conflicts:
+            conflict_files.append((file_path, len(conflicts)))
+        else:
+            staged_files.append(file_path)
+
+    print(f"\nFiles Inspected: {len(target_files)} file(s)")
+
+    if staged_files:
+        print(f"\n{CLR_GREEN}Staging Clean Files (0 remaining conflicts):{CLR_RESET}")
+        for fpath in staged_files:
+            if not dry_run:
+                try:
+                    res = subprocess.run(
+                        ["git", "add", str(fpath.resolve())],
+                        cwd=fpath.parent,
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if res.returncode == 0:
+                        print(f"  {CLR_GREEN}[STAGED]{CLR_RESET} {fpath}")
+                    else:
+                        print(f"  {CLR_YELLOW}[GIT ADD ERROR]{CLR_RESET} {fpath}: {res.stderr.strip()}")
+                except Exception as e:
+                    print(f"  {CLR_RED}[FAILED]{CLR_RESET} {fpath}: {e}")
+            else:
+                print(f"  [DRY-RUN STAGE] {fpath}")
+
+    if conflict_files:
+        print(f"\n{CLR_YELLOW}Files with Remaining Conflicts (NOT staged):{CLR_RESET}")
+        for fpath, c_count in conflict_files:
+            print(f"  {CLR_YELLOW}[CONFLICT]{CLR_RESET} {fpath} ({c_count} conflict marker(s) remaining)")
+
+    print("\n" + "-" * 60)
+    print(f"Staging Summary: Clean Files Staged: {CLR_GREEN}{len(staged_files)}{CLR_RESET} | Files with Conflicts Remaining: {CLR_YELLOW}{len(conflict_files)}{CLR_RESET}")
 
 
 def run_mode_4_metadata_diagnostic(target_files: List[Path]) -> List[DiagnosticIssue]:
@@ -1194,6 +1282,146 @@ def run_mode_4_metadata_diagnostic(target_files: List[Path]) -> List[DiagnosticI
             print(f"      {CLR_RED}[{iss.issue_type}]{CLR_RESET} {iss.description}")
 
     return issues
+
+
+def run_mode_5_detailed_conflict_review(
+    target_files: List[Path], dry_run: bool, auto_keep_state: List[Optional[str]], stats: SummaryStats
+) -> None:
+    """
+    Mode 5: Reviews remaining Git conflicts one-by-one with full line-by-line diff highlights (* <-- DIFFERENT).
+    Guarantees Option [1] is ALWAYS Incoming Change (Top) and Option [2] is ALWAYS Current Branch / HEAD (Bottom).
+    """
+    print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
+    print(CLR_BOLD + "  MODE 5: Detailed Conflict Review & Visual Diff Viewer" + CLR_RESET)
+    print(CLR_CYAN + "================================================================================" + CLR_RESET)
+
+    for file_idx, file_path in enumerate(target_files, 1):
+        try:
+            with open(file_path, "rb") as f:
+                chunk = f.read(8192)
+                if b"\x00" in chunk:
+                    stats.files_skipped += 1
+                    continue
+                f.seek(0)
+                raw_bytes = f.read()
+        except Exception:
+            stats.files_skipped += 1
+            continue
+
+        has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
+        try:
+            content = (raw_bytes[3:] if has_bom else raw_bytes).decode("utf-8")
+        except UnicodeDecodeError:
+            stats.files_skipped += 1
+            continue
+
+        lines = content.splitlines(keepends=True)
+        conflicts = parse_git_conflict_blocks(lines, tag_filter="all")
+        if not conflicts:
+            continue
+
+        stats.files_scanned += 1
+        num_conflicts = len(conflicts)
+        lines_to_delete: Set[int] = set()
+
+        print(f"\nFile [{file_idx}/{len(target_files)}]: {file_path} - Found {num_conflicts} conflict(s) for review.")
+
+        for c_idx, conflict in enumerate(conflicts, 1):
+            stats.conflicts_found += 1
+
+            diff_summary, diff_set1, diff_set2 = compute_line_differences(conflict.incoming_lines, conflict.head_lines)
+
+            print("\n" + CLR_BOLD + f"Conflict {c_idx} of {num_conflicts} (Lines {conflict.start_line + 1}-{conflict.end_line + 1}):" + CLR_RESET)
+
+            if diff_summary:
+                print("\n" + CLR_CYAN + "  • Key Line Differences Highlight:" + CLR_RESET)
+                for d_line in diff_summary:
+                    print(d_line)
+
+            # Option 1: ALWAYS Incoming Change (Top)
+            fmt_incoming = format_lines_with_diff_highlights(conflict.incoming_lines, diff_set1)
+            print("\n" + CLR_BOLD + f"--- Option [1] [{conflict.incoming_label}] (Top) ---" + CLR_RESET)
+            print(fmt_incoming)
+
+            # Option 2: ALWAYS Current Branch / HEAD (Bottom)
+            fmt_head = format_lines_with_diff_highlights(conflict.head_lines, diff_set2)
+            print("\n" + CLR_BOLD + f"--- Option [2] [{conflict.head_label}] (Bottom) ---" + CLR_RESET)
+            print(fmt_head)
+
+            print("-" * 60)
+
+            selected_option = None
+
+            if auto_keep_state[0] == "first":
+                selected_option = "1"
+                print("  [AUTO-KEEP 1A] Selected Option 1 (Incoming Change)")
+            elif auto_keep_state[0] == "last":
+                selected_option = "2"
+                print("  [AUTO-KEEP 2A] Selected Option 2 (Current Branch)")
+            else:
+                while True:
+                    prompt_msg = (
+                        "Select option to KEEP for this conflict marker:\n"
+                        "  1  = Accept Option 1 [Incoming Change] (Top)\n"
+                        "  2  = Accept Option 2 [Current Branch / HEAD] (Bottom)\n"
+                        "  1A = Accept Option 1 for ALL remaining conflicts in this review session\n"
+                        "  2A = Accept Option 2 for ALL remaining conflicts in this review session\n"
+                        "  s  = Skip (Leave conflict untouched): "
+                    )
+
+                    choice = input(prompt_msg).strip().lower()
+                    if choice in ("s", "skip"):
+                        print(f"{CLR_YELLOW}Skipped conflict block (left untouched).{CLR_RESET}")
+                        stats.conflicts_skipped += 1
+                        selected_option = "s"
+                        break
+                    elif choice == "1":
+                        selected_option = "1"
+                        break
+                    elif choice == "2":
+                        selected_option = "2"
+                        break
+                    elif choice in ("1a", "a1", "all1"):
+                        selected_option = "1"
+                        auto_keep_state[0] = "first"
+                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 1 [Incoming Change] for remaining conflicts.{CLR_RESET}")
+                        break
+                    elif choice in ("2a", "a2", "all2"):
+                        selected_option = "2"
+                        auto_keep_state[0] = "last"
+                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 2 [Current Branch] for remaining conflicts.{CLR_RESET}")
+                        break
+                    print("Invalid choice. Please enter 1, 2, 1A, 2A, or s.")
+
+            if selected_option == "s":
+                continue
+
+            if selected_option in ("1", "2"):
+                stats.conflicts_resolved += 1
+                lines_to_delete.add(conflict.start_line) # Delete <<<<<<<
+                lines_to_delete.add(conflict.sep_line)   # Delete =======
+                lines_to_delete.add(conflict.end_line)   # Delete >>>>>>>
+
+                if selected_option == "1":
+                    # Keep Option 1 (Incoming): Delete all HEAD lines between start_line and sep_line
+                    for idx in range(conflict.start_line + 1, conflict.sep_line):
+                        lines_to_delete.add(idx)
+                elif selected_option == "2":
+                    # Keep Option 2 (Current): Delete all Incoming lines between sep_line and end_line
+                    for idx in range(conflict.sep_line + 1, conflict.end_line):
+                        lines_to_delete.add(idx)
+
+        if lines_to_delete and not dry_run:
+            stats.files_modified += 1
+            new_lines = [l for idx, l in enumerate(lines) if idx not in lines_to_delete]
+            cleaned_lines = cleanup_excessive_blank_lines(new_lines)
+            new_content = "".join(cleaned_lines)
+            encoded = new_content.encode("utf-8")
+            if has_bom:
+                encoded = b"\xef\xbb\xbf" + encoded
+            with open(file_path, "wb") as f:
+                f.write(encoded)
+            print(f"[UPDATED] File conflict markers resolved: {file_path}")
 
 
 def scan_and_prepare_tasks(
@@ -1323,7 +1551,7 @@ def process_file_task(
             for idx, blk in enumerate(col_blocks, 1):
                 origin = f" [{blk.git_label}]" if blk.git_label else f" [Occurrence {idx}]"
                 diff_set = diff_indices[idx - 1] if idx - 1 < len(diff_indices) else set()
-                formatted_body = format_block_with_diff_highlights(blk, diff_set)
+                formatted_body = format_lines_with_diff_highlights(blk.lines, diff_set)
 
                 print("\n" + CLR_BOLD + f"--- Option [{idx}]{origin} (Lines {blk.start_line + 1}-{blk.end_line}) ---" + CLR_RESET)
                 print(formatted_body)
@@ -1397,7 +1625,8 @@ def process_file_task(
 
 def get_action_mode(args_mode: Optional[str]) -> str:
     """
-    Returns action mode: '1' (Conflict Markers), '2' (Deduplicate Objects), '3' (Full Combo), or '4' (Metadata Diagnostic Check).
+    Returns action mode: '1' (Conflict Markers), '2' (Deduplicate Objects), '3' (Stage Clean Files),
+    '4' (Metadata Diagnostic Check), or '5' (Detailed Conflict Review).
     """
     if args_mode:
         val = args_mode.strip().lower()
@@ -1405,10 +1634,12 @@ def get_action_mode(args_mode: Optional[str]) -> str:
             return "1"
         elif val in ("2", "dedupe", "duplicates"):
             return "2"
-        elif val in ("3", "combo", "all", "full"):
+        elif val in ("3", "stage", "gitadd", "add"):
             return "3"
         elif val in ("4", "diag", "diagnostic", "check", "health"):
             return "4"
+        elif val in ("5", "review", "diff", "visual"):
+            return "5"
 
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + "               Power BI PBIP Master Conflict & Duplicate Resolver" + CLR_RESET)
@@ -1416,13 +1647,14 @@ def get_action_mode(args_mode: Optional[str]) -> str:
     print("Select resolution action to perform:")
     print(" 1 - Resolve Git Conflict Markers (lineageTag, logicalId, $schema, bookmark IDs, and all conflict markers)")
     print(" 2 - Resolve Duplicate Objects (Columns, Expressions, Relationships)")
-    print(" 3 - Full Combo Mode (Run Mode 1 then Mode 2 sequentially)")
+    print(" 3 - Stage Clean Files to Git (Automatically git add files with 0 remaining conflict markers)")
     print(" 4 - Power BI PBIP Metadata Health & Diagnostic Check (Scan for all remaining issues)")
+    print(" 5 - Detailed Conflict Review & Visual Diff Viewer (Review remaining conflicts one-by-one with diff highlights)")
     while True:
-        choice = input("Enter option (1, 2, 3, or 4): ").strip()
-        if choice in ("1", "2", "3", "4"):
+        choice = input("Enter option (1, 2, 3, 4, or 5): ").strip()
+        if choice in ("1", "2", "3", "4", "5"):
             return choice
-        print("Invalid input. Please enter 1, 2, 3, or 4.\n")
+        print("Invalid input. Please enter 1, 2, 3, 4, or 5.\n")
 
 
 def collect_target_files(target_path: Path, extensions_set: Optional[Set[str]]) -> List[Path]:
@@ -1452,7 +1684,16 @@ def run_single_execution(target_path: Path, mode: str, args) -> None:
         run_mode_4_metadata_diagnostic(target_files)
         return
 
-    if mode in ("1", "3"):
+    if mode == "3":
+        run_mode_3_stage_clean_files(target_files, args.dry_run)
+        return
+
+    if mode == "5":
+        auto_keep_m5 = [initial_auto_keep]
+        run_mode_5_detailed_conflict_review(target_files, args.dry_run, auto_keep_m5, stats)
+        return
+
+    if mode == "1":
         conflict_target_type = get_conflict_target_type(args.conflict_type)
         propagate_refs = False
         if conflict_target_type in ("bookmark", "all"):
@@ -1461,7 +1702,7 @@ def run_single_execution(target_path: Path, mode: str, args) -> None:
         auto_keep_m1 = [initial_auto_keep]
         run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_m1, stats, propagate_refs=propagate_refs)
 
-    if mode in ("2", "3"):
+    if mode == "2":
         target_object_type = get_target_object_type(args.type)
         auto_keep_m2 = [initial_auto_keep]
         run_mode_2_dedupe_objects(target_files, target_object_type, args.dry_run, auto_keep_m2, stats)
@@ -1469,11 +1710,11 @@ def run_single_execution(target_path: Path, mode: str, args) -> None:
     print("\n--- Final Summary ---")
     print(f"Files scanned: {stats.files_scanned}")
     print(f"Files modified: {stats.files_modified}")
-    if mode in ("1", "3"):
+    if mode in ("1", "5"):
         print(f"Conflict markers found: {stats.conflicts_found}")
         print(f"Conflict markers resolved: {stats.conflicts_resolved}")
         print(f"Conflict markers skipped: {stats.conflicts_skipped}")
-    if mode in ("2", "3"):
+    if mode == "2":
         print(f"Duplicate object groups found: {stats.duplicates_found}")
         print(f"Duplicate object groups resolved: {stats.duplicates_resolved}")
         print(f"Duplicate object groups skipped: {stats.duplicates_skipped}")
@@ -1491,8 +1732,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["1", "2", "3", "4", "conflict", "dedupe", "combo", "diag"],
-        help="Action mode: 1 (Conflict Markers), 2 (Deduplicate Objects), 3 (Full Combo), 4 (Metadata Diagnostic).",
+        choices=["1", "2", "3", "4", "5", "conflict", "dedupe", "stage", "diag", "review"],
+        help="Action mode: 1 (Conflict Markers), 2 (Deduplicate Objects), 3 (Stage Clean Files), 4 (Metadata Diagnostic), 5 (Detailed Conflict Review).",
     )
     parser.add_argument(
         "--conflict-type",
@@ -1584,20 +1825,13 @@ def main() -> None:
             print(f"Files scanned: {stats.files_scanned} | Modified: {stats.files_modified}")
             print(f"Duplicates found: {stats.duplicates_found} | Resolved: {stats.duplicates_resolved} | Skipped: {stats.duplicates_skipped}")
         elif mode == "3":
-            conflict_target_type = get_conflict_target_type(args.conflict_type)
-            propagate_refs = False
-            if conflict_target_type in ("bookmark", "all"):
-                propagate_refs = ask_propagate_cross_references(args.propagate_refs if hasattr(args, "propagate_refs") and args.propagate_refs else None)
-
-            auto_keep_m1 = [initial_auto_keep]
-            run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_m1, stats, propagate_refs=propagate_refs)
-
-            target_object_type = get_target_object_type(args.type)
-            auto_keep_m2 = [initial_auto_keep]
-            run_mode_2_dedupe_objects(target_files, target_object_type, args.dry_run, auto_keep_m2, stats)
-            print("\n--- Final Summary ---")
+            run_mode_3_stage_clean_files(target_files, args.dry_run)
+        elif mode == "5":
+            auto_keep_m5 = [initial_auto_keep]
+            run_mode_5_detailed_conflict_review(target_files, args.dry_run, auto_keep_m5, stats)
+            print("\n--- Summary ---")
             print(f"Files scanned: {stats.files_scanned} | Modified: {stats.files_modified}")
-            print(f"Conflict markers resolved: {stats.conflicts_resolved} | Duplicates resolved: {stats.duplicates_resolved}")
+            print(f"Conflict markers found: {stats.conflicts_found} | Resolved: {stats.conflicts_resolved} | Skipped: {stats.conflicts_skipped}")
 
         # Sub-menu navigation return prompt
         print("\n" + CLR_CYAN + "--------------------------------------------------------------------------------" + CLR_RESET)
@@ -1620,4 +1854,4 @@ if __name__ == "__main__":
 
 # Example usage:
 # python PBIP-ConflictsResolve.py
-# python PBIP-ConflictsResolve.py "C:/path/to/report"
+# python PBIP-ConflictsResolve.py "C:/path/to/report" --mode 5
