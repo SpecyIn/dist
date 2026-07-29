@@ -27,8 +27,8 @@ Modes & Capabilities:
    - Target Objects: 1 - Columns, 2 - Expressions, 3 - Relationships (reverse pair canonical matching), 4 - JSON Comma & Syntax Auto-Formatter, 5 - All.
    - Auto-Fixes missing commas between adjacent JSON objects (}\n{ -> },\n{), removes duplicate commas, and strips invalid trailing commas before brackets.
 
-3. Mode 3: Stage Clean Files to Git (Batched High-Speed Staging - 100x FASTER).
-   - Automatically executes batched 'git add' on all project files containing 0 remaining conflict markers in chunks of 50 files per process.
+3. Mode 3: Stage Clean Files to Git (Batched High-Speed Staging - SKIPS Already Staged Files).
+   - Automatically executes batched 'git add' on clean files, skipping files that are already staged in Git index for maximum performance.
 
 4. Mode 4: Power BI PBIP Metadata Health & Diagnostic Check.
    - Complete health validation scanning for remaining Git conflict markers, duplicate TMDL objects, JSON syntax errors, and missing lineageTags with exact line numbers.
@@ -39,6 +39,7 @@ Modes & Capabilities:
 
 Features & Controls:
 - Batched Git Staging (Mode 3): Batches up to 50 paths per 'git add' process for 100x to 500x faster staging execution.
+- Smart Staging Skip: Queries 'git status --porcelain' to skip already-staged clean files, saving time and CPU.
 - Scoped Auto-Resolve (1A / 2A): '1A' or '2A' applies strictly to the currently selected property filter or object category session.
 - Interactive Navigation Loop: Sub-menu prompt to return to the Main Menu after completing tasks.
 - Full Fabric & Power BI File Support: Scans .tmdl, .json, .pbir, .pbip, .platform, .fabric, .definition, .item, and .report files.
@@ -510,6 +511,32 @@ def get_git_head_content(file_path: Path) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def get_git_staged_clean_files(repo_dir: Path) -> Set[Path]:
+    """
+    Runs 'git status --porcelain' to find files that are ALREADY staged in index with 0 unstaged worktree changes.
+    """
+    already_staged_clean: Set[Path] = set()
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                if len(line) >= 4:
+                    xy = line[:2]
+                    rel_path_str = line[3:].strip().strip('"')
+                    abs_path = (repo_dir / rel_path_str).resolve()
+                    if xy[0] in ('M', 'A', 'R', 'C') and xy[1] == ' ':
+                        already_staged_clean.add(abs_path)
+    except Exception:
+        pass
+    return already_staged_clean
 
 
 def check_git_origin_for_blocks(
@@ -1257,7 +1284,8 @@ def run_mode_2_dedupe_objects(
 
 def run_mode_3_stage_clean_files(target_files: List[Path], dry_run: bool) -> None:
     """
-    Mode 3: Automatically runs 'git add' on all target files that have 0 remaining conflict markers using BATCHED execution (100x FASTER).
+    Mode 3: Automatically runs 'git add' on target files with 0 remaining conflicts.
+    SKIPS files that are already staged in Git index for maximum performance.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + "  MODE 3: Stage Clean Files to Git (0 Remaining Conflicts - BATCHED FAST MODE)" + CLR_RESET)
@@ -1293,40 +1321,58 @@ def run_mode_3_stage_clean_files(target_files: List[Path], dry_run: bool) -> Non
 
     print(f"\nFiles Inspected: {len(target_files)} file(s)")
 
+    files_to_stage: List[Path] = []
+    already_staged_skipped: List[Path] = []
+
     if staged_files:
-        print(f"\n{CLR_GREEN}Staging {len(staged_files)} Clean File(s) to Git Index...{CLR_RESET}")
+        repo_groups: Dict[Path, List[Path]] = {}
+        for fpath in staged_files:
+            repo_groups.setdefault(fpath.parent, []).append(fpath)
 
-        if not dry_run:
-            repo_groups: Dict[Path, List[Path]] = {}
-            for fpath in staged_files:
-                repo_groups.setdefault(fpath.parent, []).append(fpath)
+        for parent_dir, fpaths in repo_groups.items():
+            staged_in_repo = get_git_staged_clean_files(parent_dir)
+            for fp in fpaths:
+                if fp.resolve() in staged_in_repo:
+                    already_staged_skipped.append(fp)
+                else:
+                    files_to_stage.append(fp)
 
-            CHUNK_SIZE = 50
-            staged_success_count = 0
+        if already_staged_skipped:
+            print(f"\n{CLR_YELLOW}Already Staged in Git Index (Skipped {len(already_staged_skipped)} file(s)):{CLR_RESET}")
+            for fp in already_staged_skipped:
+                print(f"  {CLR_YELLOW}[ALREADY STAGED - SKIPPED]{CLR_RESET} {fp}")
 
-            for parent_dir, fpaths in repo_groups.items():
-                for i in range(0, len(fpaths), CHUNK_SIZE):
-                    chunk_paths = fpaths[i:i + CHUNK_SIZE]
-                    cmd = ["git", "add"] + [str(p.resolve()) for p in chunk_paths]
-                    try:
-                        res = subprocess.run(
-                            cmd,
-                            cwd=parent_dir,
-                            capture_output=True,
-                            text=True,
-                            timeout=10
-                        )
-                        if res.returncode == 0:
-                            staged_success_count += len(chunk_paths)
-                            for p in chunk_paths:
-                                print(f"  {CLR_GREEN}[STAGED]{CLR_RESET} {p}")
-                        else:
-                            print(f"  {CLR_YELLOW}[GIT ADD ERROR]{CLR_RESET} Batch of {len(chunk_paths)} files failed: {res.stderr.strip()}")
-                    except Exception as e:
-                        print(f"  {CLR_RED}[FAILED]{CLR_RESET} Batch of {len(chunk_paths)} files error: {e}")
-        else:
-            for fpath in staged_files:
-                print(f"  [DRY-RUN STAGE] {fpath}")
+        if files_to_stage:
+            print(f"\n{CLR_GREEN}Staging {len(files_to_stage)} Clean File(s) to Git Index...{CLR_RESET}")
+
+            if not dry_run:
+                stage_repo_groups: Dict[Path, List[Path]] = {}
+                for fpath in files_to_stage:
+                    stage_repo_groups.setdefault(fpath.parent, []).append(fpath)
+
+                CHUNK_SIZE = 50
+                for parent_dir, fpaths in stage_repo_groups.items():
+                    for i in range(0, len(fpaths), CHUNK_SIZE):
+                        chunk_paths = fpaths[i:i + CHUNK_SIZE]
+                        cmd = ["git", "add"] + [str(p.resolve()) for p in chunk_paths]
+                        try:
+                            res = subprocess.run(
+                                cmd,
+                                cwd=parent_dir,
+                                capture_output=True,
+                                text=True,
+                                timeout=10
+                            )
+                            if res.returncode == 0:
+                                for p in chunk_paths:
+                                    print(f"  {CLR_GREEN}[STAGED]{CLR_RESET} {p}")
+                            else:
+                                print(f"  {CLR_YELLOW}[GIT ADD ERROR]{CLR_RESET} Batch of {len(chunk_paths)} files failed: {res.stderr.strip()}")
+                        except Exception as e:
+                            print(f"  {CLR_RED}[FAILED]{CLR_RESET} Batch of {len(chunk_paths)} files error: {e}")
+            else:
+                for fpath in files_to_stage:
+                    print(f"  [DRY-RUN STAGE] {fpath}")
 
     if conflict_files:
         print(f"\n{CLR_YELLOW}Files with Remaining Conflicts (NOT staged):{CLR_RESET}")
@@ -1334,7 +1380,7 @@ def run_mode_3_stage_clean_files(target_files: List[Path], dry_run: bool) -> Non
             print(f"  {CLR_YELLOW}[CONFLICT]{CLR_RESET} {fpath} ({c_count} conflict marker(s) remaining)")
 
     print("\n" + "-" * 60)
-    print(f"Staging Summary: Clean Files Staged: {CLR_GREEN}{len(staged_files)}{CLR_RESET} | Files with Conflicts Remaining: {CLR_YELLOW}{len(conflict_files)}{CLR_RESET}")
+    print(f"Staging Summary: Clean Files Newly Staged: {CLR_GREEN}{len(files_to_stage)}{CLR_RESET} | Already Staged (Skipped): {CLR_YELLOW}{len(already_staged_skipped)}{CLR_RESET} | Files with Conflicts Remaining: {CLR_YELLOW}{len(conflict_files)}{CLR_RESET}")
 
 
 def run_mode_4_metadata_diagnostic(target_files: List[Path]) -> List[DiagnosticIssue]:
