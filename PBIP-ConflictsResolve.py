@@ -4,7 +4,7 @@ Power BI PBIP All-in-One Conflict, Duplicate, Staging & Health Resolver (PBIP-Co
 
 Production-grade master script for automated and interactive Power BI PBIP / Fabric dataset management.
 Combines Git Conflict Marker resolution, Duplicate Object deduplication, High-Speed Batched Git Staging,
-Metadata Health Check, and Detailed Visual Conflict Diff Review into a single, zero-dependency Python script.
+Metadata Health Check, JSON Syntax/Comma Auto-Formatting, and Detailed Visual Conflict Diff Review into a single, zero-dependency Python script.
 
 Modes & Capabilities:
 1. Mode 1: Git Conflict Marker Resolution (<<<<<<<, =======, >>>>>>>).
@@ -13,19 +13,19 @@ Modes & Capabilities:
      2 - LogicalIds (logicalId, sourceLogicalId in TMDL, JSON, & .platform files)
      3 - SchemaTags ($schema: "https://..." in PBIP JSON report files)
      4 - Bookmark / Object Name IDs ("name": "<hex-hash>" in bookmarks.json, page.json, visual.json)
-     5 - Additions Only (Accepts additions when one side contains all lines of the other side plus extra lines)
+     5 - Additions Only (Accepts additions when one side contains all lines of the other side OR when one side is empty)
      6 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)
    - Features:
+     - Empty-Side & Subset Addition Detection: Auto-identifies pure additions even when one branch is completely empty.
      - Pure vs Mixed Conflict Detection: Detects single-line property vs mixed visual/expression changes.
-     - Subset Addition Detection: Auto-identifies when a conflict is purely an addition over existing base lines.
      - Partial Fix Options (1P / 2P): Resolves property lines while keeping conflict markers around visual changes.
      - Bookmark Content Divergence Protection: Detects if bookmark content differs alongside ID, pausing 1A/2A auto-keep to prompt for safe manual choice.
      - Performance-Optimized Optional Cross-Reference Propagation: Scans project files to update cross-references of replaced bookmark/object IDs.
      - Bulletproof Index-Based Deletion: Immune to line ending (\r\n vs \n) or whitespace differences.
 
-2. Mode 2: Duplicate Object Resolution (when conflict markers are absent, e.g. after Accept Both Changes).
-   - Supports: 1 - Columns, 2 - Expressions, 3 - Relationships (with reverse pair canonical matching fromA->toB vs fromB->toA), 4 - All.
-   - Queries Git HEAD to track origin of duplicate definitions.
+2. Mode 2: Duplicate Object & JSON Comma Formatting Resolver.
+   - Target Objects: 1 - Columns, 2 - Expressions, 3 - Relationships (reverse pair canonical matching), 4 - JSON Comma & Syntax Auto-Formatter, 5 - All.
+   - Auto-Fixes missing commas between adjacent JSON objects (}\n{ -> },\n{), removes duplicate commas, and strips invalid trailing commas before brackets.
 
 3. Mode 3: Stage Clean Files to Git (Batched High-Speed Staging - 100x FASTER).
    - Automatically executes batched 'git add' on all project files containing 0 remaining conflict markers in chunks of 50 files per process.
@@ -193,6 +193,64 @@ def cleanup_excessive_blank_lines(lines: List[str]) -> List[str]:
     return cleaned
 
 
+def fix_pbip_json_formatting(content: str) -> str:
+    """
+    Auto-fixes common JSON formatting issues resulting from Git merge additions:
+    1. Missing commas between adjacent objects/elements in JSON arrays (e.g. }\n{ -> },\n{).
+    2. Duplicate commas (e.g. ,,\n -> ,\n).
+    3. Trailing commas before closing brackets/braces (e.g. ,\n] -> \n]).
+    """
+    if not content.strip():
+        return content
+
+    # Fix duplicate commas
+    content = re.sub(r',\s*,', ',', content)
+
+    # Fix missing commas between closing brace/quote/digit/boolean/null and opening brace/quote/bracket on next line
+    lines = content.splitlines(keepends=True)
+    fixed_lines: List[str] = []
+    n = len(lines)
+
+    for i in range(n):
+        line = lines[i]
+        fixed_lines.append(line)
+
+        if i < n - 1:
+            curr_strip = line.strip()
+            next_strip = lines[i + 1].strip()
+
+            if (
+                curr_strip
+                and not curr_strip.endswith(",")
+                and not curr_strip.endswith("{")
+                and not curr_strip.endswith("[")
+                and not curr_strip.startswith("<<<<<<<")
+                and not curr_strip.startswith("=======")
+                and not curr_strip.startswith(">>>>>>>")
+            ):
+                ends_with_val = (
+                    curr_strip.endswith("}") or
+                    curr_strip.endswith("]") or
+                    curr_strip.endswith('"') or
+                    re.search(r'(:\s*(?:true|false|null|\d+|\"[^\"]*\"))$', curr_strip)
+                )
+                starts_with_new_item = (
+                    next_strip.startswith("{") or
+                    next_strip.startswith("[") or
+                    next_strip.startswith('"')
+                )
+
+                if ends_with_val and starts_with_new_item:
+                    eol = "\r\n" if line.endswith("\r\n") else "\n"
+                    fixed_lines[-1] = line.rstrip("\r\n") + "," + eol
+
+    new_content = "".join(fixed_lines)
+    # Remove trailing commas before closing } or ]
+    new_content = re.sub(r',\s*([\}\]])', r'\n\1', new_content)
+
+    return new_content
+
+
 def extract_column_name(header_str: str) -> str:
     """Extracts object name from TMDL header string, removing expression parts and quotes."""
     name_part = header_str.split("=")[0].strip()
@@ -226,11 +284,17 @@ def get_canonical_relationship_key(from_col: str, to_col: str) -> Tuple[str, str
 
 def is_subset_addition(lines_a: List[str], lines_b: List[str]) -> bool:
     """
-    Checks if lines_a is a non-empty subset of lines_b (ignoring whitespace and trailing commas).
-    Returns True if lines_b contains all lines of lines_a PLUS extra addition line(s).
+    Checks if lines_a is a subset of lines_b (ignoring whitespace and trailing commas).
+    Returns True if lines_b contains all lines of lines_a PLUS extra addition line(s)
+    OR if lines_a is completely empty and lines_b contains content.
     """
     clean_a = [l.strip().rstrip(",") for l in lines_a if l.strip()]
     clean_b = [l.strip().rstrip(",") for l in lines_b if l.strip()]
+
+    # If side A is completely empty and side B has lines, B is a pure addition over empty A!
+    if not clean_a and clean_b:
+        return True
+
     if not clean_a or not clean_b:
         return False
 
@@ -331,10 +395,6 @@ def sort_blocks_incoming_first(col_blocks: List[ColumnBlock]) -> List[ColumnBloc
 def compute_line_differences(lines1: List[str], lines2: List[str]) -> Tuple[List[str], Set[int], Set[int]]:
     """
     Computes exact line differences between Option 1 (lines1) and Option 2 (lines2).
-    Returns:
-      diff_summary: list of formatted strings describing property diffs in color.
-      diff_set1: set of line indices in lines1 that differ.
-      diff_set2: set of line indices in lines2 that differ.
     """
     diff_summary: List[str] = []
     diff_set1: Set[int] = set()
@@ -653,7 +713,7 @@ def parse_git_conflict_blocks(
     - 'logical_id': blocks containing logicalId or sourceLogicalId
     - 'schema': blocks containing $schema
     - 'bookmark': blocks containing "name": "<hex-hash>"
-    - 'addition': blocks where one side contains all lines of the other side plus additions
+    - 'addition': blocks where one side contains all lines of the other side OR where one side is empty
     - 'all': any conflict block (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)
     """
     conflict_blocks: List[ConflictMarkerBlock] = []
@@ -843,7 +903,7 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
     print(" 2 - LogicalIds (logicalId, sourceLogicalId)")
     print(" 3 - SchemaTags ($schema: \"https://...\")")
     print(" 4 - Bookmark / Object Name IDs (\"name\": \"<hex-hash>\")")
-    print(" 5 - Additions Only (Accept additions when one side contains all lines of the other side plus extra lines)")
+    print(" 5 - Additions Only (Accept additions when one side contains all lines of the other side OR when one side is empty)")
     print(" 6 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)")
     while True:
         choice = input("Enter option (1, 2, 3, 4, 5, or 6): ").strip()
@@ -864,7 +924,7 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
 
 def get_target_object_type(args_type: Optional[str]) -> str:
     """
-    Returns normalized target object type for Mode 2: 'column', 'expression', 'relationship', or 'all'.
+    Returns normalized target object type for Mode 2: 'column', 'expression', 'relationship', 'formatter', or 'all'.
     """
     if args_type:
         val = args_type.strip().lower()
@@ -874,16 +934,19 @@ def get_target_object_type(args_type: Optional[str]) -> str:
             return "expression"
         elif val in ("3", "relationship", "relationships"):
             return "relationship"
-        elif val in ("4", "all", "both"):
+        elif val in ("4", "formatter", "format", "comma", "json"):
+            return "formatter"
+        elif val in ("5", "all", "both"):
             return "all"
 
     print("\nSelect target object type to process (Mode 2):")
     print(" 1 - Columns")
     print(" 2 - Expressions")
     print(" 3 - Relationships")
-    print(" 4 - All (Columns, Expressions & Relationships)")
+    print(" 4 - JSON Comma & Syntax Auto-Formatter (Fix missing/duplicate commas resulting from additions)")
+    print(" 5 - All (Columns, Expressions, Relationships & Comma Formatting Auto-Fixer)")
     while True:
-        choice = input("Enter option (1, 2, 3, or 4): ").strip()
+        choice = input("Enter option (1, 2, 3, 4, or 5): ").strip()
         if choice == "1":
             return "column"
         elif choice == "2":
@@ -891,8 +954,10 @@ def get_target_object_type(args_type: Optional[str]) -> str:
         elif choice == "3":
             return "relationship"
         elif choice == "4":
+            return "formatter"
+        elif choice == "5":
             return "all"
-        print("Invalid input. Please enter 1, 2, 3, or 4.\n")
+        print("Invalid input. Please enter 1, 2, 3, 4, or 5.\n")
 
 
 def run_mode_1_conflict_markers(
@@ -902,6 +967,7 @@ def run_mode_1_conflict_markers(
     Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) filtered by conflict_target_type.
     Performs global cross-reference hash propagation ONLY if propagate_refs is True.
     When bookmark content is DIFFERENT, ALWAYS prompts the user (overriding 1A/2A auto-keep for safe manual decision).
+    Auto-formats JSON comma syntax after file modification.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
@@ -1132,33 +1198,61 @@ def run_mode_1_conflict_markers(
 
             cleaned_lines = cleanup_excessive_blank_lines(new_lines)
             new_content = "".join(cleaned_lines)
+
+            # Automatically fix JSON comma syntax formatting if JSON/report file
+            if file_path.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
+                new_content = fix_pbip_json_formatting(new_content)
+
             encoded = new_content.encode("utf-8")
             if has_bom:
                 encoded = b"\xef\xbb\xbf" + encoded
             with open(file_path, "wb") as f:
                 f.write(encoded)
-            print(f"[UPDATED] File conflict markers resolved: {file_path}")
+            print(f"[UPDATED] File conflict markers resolved & JSON formatted: {file_path}")
 
 
 def run_mode_2_dedupe_objects(
     target_files: List[Path], target_object_type: str, dry_run: bool, auto_keep_state: List[Optional[str]], stats: SummaryStats
 ) -> None:
     """
-    Mode 2: Deduplicates Objects (Columns, Expressions, Relationships) when conflict markers are absent.
-    auto_keep_state is scoped locally to this object type run.
+    Mode 2: Deduplicates Objects (Columns, Expressions, Relationships) and auto-fixes JSON comma syntax formatting.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
-    print(CLR_BOLD + f"  MODE 2: Resolving Duplicate Objects (Target: {target_object_type.upper()})" + CLR_RESET)
+    print(CLR_BOLD + f"  MODE 2: Resolving Duplicate Objects & JSON Formatter (Target: {target_object_type.upper()})" + CLR_RESET)
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
 
-    tasks, total_duplicates_all = scan_and_prepare_tasks(target_files, target_object_type, stats)
-    global_remaining = [total_duplicates_all]
-    total_files = len(tasks)
+    if target_object_type in ("formatter", "all"):
+        json_files_fixed = 0
+        for fpath in target_files:
+            if fpath.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
+                try:
+                    with open(fpath, "rb") as f:
+                        raw = f.read()
+                    has_bom = raw.startswith(b"\xef\xbb\xbf")
+                    txt = (raw[3:] if has_bom else raw).decode("utf-8")
+                    fixed = fix_pbip_json_formatting(txt)
+                    if fixed != txt and not dry_run:
+                        enc = fixed.encode("utf-8")
+                        if has_bom:
+                            enc = b"\xef\xbb\xbf" + enc
+                        with open(fpath, "wb") as f:
+                            f.write(enc)
+                        json_files_fixed += 1
+                        print(f"  {CLR_GREEN}[FORMATTED]{CLR_RESET} Fixed JSON comma/syntax formatting in: {fpath}")
+                except Exception:
+                    pass
+        if json_files_fixed > 0:
+            print(f"\n{CLR_GREEN}--> Auto-Formatted JSON Comma Syntax in {json_files_fixed} file(s).{CLR_RESET}")
 
-    for file_idx, task in enumerate(tasks, 1):
-        process_file_task(
-            task, file_idx, total_files, dry_run, auto_keep_state, global_remaining, stats
-        )
+    if target_object_type != "formatter":
+        tasks, total_duplicates_all = scan_and_prepare_tasks(target_files, target_object_type, stats)
+        global_remaining = [total_duplicates_all]
+        total_files = len(tasks)
+
+        for file_idx, task in enumerate(tasks, 1):
+            process_file_task(
+                task, file_idx, total_files, dry_run, auto_keep_state, global_remaining, stats
+            )
 
 
 def run_mode_3_stage_clean_files(target_files: List[Path], dry_run: bool) -> None:
@@ -1480,12 +1574,17 @@ def run_mode_5_detailed_conflict_review(
             new_lines = [l for idx, l in enumerate(lines) if idx not in lines_to_delete]
             cleaned_lines = cleanup_excessive_blank_lines(new_lines)
             new_content = "".join(cleaned_lines)
+
+            # Auto-format JSON syntax/commas if JSON/report file
+            if file_path.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
+                new_content = fix_pbip_json_formatting(new_content)
+
             encoded = new_content.encode("utf-8")
             if has_bom:
                 encoded = b"\xef\xbb\xbf" + encoded
             with open(file_path, "wb") as f:
                 f.write(encoded)
-            print(f"[UPDATED] File conflict markers resolved: {file_path}")
+            print(f"[UPDATED] File conflict markers resolved & JSON formatted: {file_path}")
 
 
 def scan_and_prepare_tasks(
@@ -1679,17 +1778,22 @@ def process_file_task(
         new_lines = [line for idx, line in enumerate(task.lines) if idx not in lines_to_delete]
         cleaned_lines = cleanup_excessive_blank_lines(new_lines)
         new_content = "".join(cleaned_lines)
+
+        # Auto-format JSON syntax/commas if JSON/report file
+        if task.file_path.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
+            new_content = fix_pbip_json_formatting(new_content)
+
         encoded_data = new_content.encode("utf-8")
         if task.has_bom:
             encoded_data = b"\xef\xbb\xbf" + encoded_data
         with open(task.file_path, "wb") as f:
             f.write(encoded_data)
-        print(f"\n[UPDATED] File updated with clean spacing: {task.file_path}")
+        print(f"\n[UPDATED] File updated with clean spacing & JSON formatting: {task.file_path}")
 
 
 def get_action_mode(args_mode: Optional[str]) -> str:
     """
-    Returns action mode: '1' (Conflict Markers), '2' (Deduplicate Objects), '3' (Stage Clean Files),
+    Returns action mode: '1' (Conflict Markers), '2' (Deduplicate Objects & Formatter), '3' (Stage Clean Files),
     '4' (Metadata Diagnostic Check), or '5' (Detailed Conflict Review).
     """
     if args_mode:
@@ -1710,7 +1814,7 @@ def get_action_mode(args_mode: Optional[str]) -> str:
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
     print("Select resolution action to perform:")
     print(" 1 - Resolve Git Conflict Markers (lineageTag, logicalId, $schema, bookmark IDs, additions, and all conflicts)")
-    print(" 2 - Resolve Duplicate Objects (Columns, Expressions, Relationships)")
+    print(" 2 - Resolve Duplicate Objects & Auto-Format JSON Commas/Syntax")
     print(" 3 - Stage Clean Files to Git (Automatically git add files with 0 remaining conflict markers)")
     print(" 4 - Power BI PBIP Metadata Health & Diagnostic Check (Scan for all remaining issues)")
     print(" 5 - Detailed Conflict Review & Visual Diff Viewer (Review remaining conflicts one-by-one with diff highlights)")
@@ -1806,8 +1910,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--type",
-        choices=["1", "2", "3", "4", "column", "expression", "relationship", "all"],
-        help="Target object type for Mode 2 deduplication: 1/column, 2/expression, 3/relationship, 4/all.",
+        choices=["1", "2", "3", "4", "5", "column", "expression", "relationship", "formatter", "all"],
+        help="Target object type for Mode 2 deduplication: 1/column, 2/expression, 3/relationship, 4/formatter, 5/all.",
     )
     parser.add_argument(
         "--propagate-refs",
