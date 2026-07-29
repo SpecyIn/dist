@@ -8,12 +8,13 @@ into a single, self-contained Python script with interactive main menu navigatio
 Capabilities:
 1. Mode 1: Resolve Git Conflict Markers (<<<<<<<, =======, >>>>>>>).
    - Option 1: LineageTags (lineageTag, sourceLineageTag)
-   - Option 2: SchemaTags ($schema: "https://...")
-   - Option 3: Bookmark / Object Name IDs ("name": "<hex-hash>")
+   - Option 2: LogicalIds (logicalId, sourceLogicalId)
+   - Option 3: SchemaTags ($schema: "https://...")
+   - Option 4: Bookmark / Object Name IDs ("name": "<hex-hash>")
      - Same Content + Different Name: Resolves bookmark ID cleanly.
      - Different Content + Different Name: Detects content divergence, pauses 1A auto-keep, and ALWAYS prompts user to accept Option 1 (Incoming), Option 2 (Current), or Skip.
      - Optional Cross-Reference Propagation.
-   - Option 4: All Conflict Markers (LineageTags, SchemaTags, Bookmark IDs & All Other Conflicts)
+   - Option 5: All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs & All Other Conflicts)
    - Pure vs Mixed Conflict Detection: Detects whether a conflict block contains ONLY target properties or mixed changes.
    - Partial Fix Options (1P / 2P): Resolves ONLY the target property line while preserving Git conflict markers around visual/expression changes!
 2. Mode 2: Deduplicate Objects (Columns, Expressions, Relationships) when conflict markers are absent (e.g. Accept Both Changes).
@@ -137,6 +138,12 @@ TAG_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Regex to match logicalId or sourceLogicalId property lines with optional quotes
+LOGICAL_ID_PATTERN = re.compile(
+    r'^\s*["\']?(logicalId|sourceLogicalId)["\']?\s*:\s*(.+)$',
+    re.IGNORECASE
+)
+
 # Regex to match $schema property lines with optional quotes
 SCHEMA_PATTERN = re.compile(
     r'^\s*["\']?\$schema["\']?\s*:\s*(.+)$',
@@ -220,6 +227,8 @@ def is_pure_property_conflict(conflict: ConflictMarkerBlock, tag_filter: str) ->
 
     if tag_filter == "lineage":
         return all(TAG_PATTERN.match(l) for l in all_lines)
+    elif tag_filter == "logical_id":
+        return all(LOGICAL_ID_PATTERN.match(l) for l in all_lines)
     elif tag_filter == "schema":
         return all(SCHEMA_PATTERN.match(l) for l in all_lines)
     elif tag_filter == "bookmark":
@@ -607,9 +616,10 @@ def parse_git_conflict_blocks(
     """
     Finds Git conflict blocks (<<<<<<<, =======, >>>>>>>) filtered by tag_filter:
     - 'lineage': blocks containing lineageTag or sourceLineageTag
+    - 'logical_id': blocks containing logicalId or sourceLogicalId
     - 'schema': blocks containing $schema
     - 'bookmark': blocks containing "name": "<hex-hash>"
-    - 'all': any conflict block (LineageTags, SchemaTags, Bookmark IDs, and all other conflicts)
+    - 'all': any conflict block (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, and all other conflicts)
     """
     conflict_blocks: List[ConflictMarkerBlock] = []
     i = 0
@@ -646,6 +656,8 @@ def parse_git_conflict_blocks(
                 should_include = False
                 if tag_filter == "lineage":
                     should_include = any(TAG_PATTERN.match(l) for l in all_block_lines)
+                elif tag_filter == "logical_id":
+                    should_include = any(LOGICAL_ID_PATTERN.match(l) for l in all_block_lines)
                 elif tag_filter == "schema":
                     should_include = any(SCHEMA_PATTERN.match(l) for l in all_block_lines)
                 elif tag_filter == "bookmark":
@@ -770,36 +782,41 @@ def ask_propagate_cross_references(args_propagate: Optional[bool] = None) -> boo
 
 def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
     """
-    Returns normalized conflict marker target filter: 'lineage', 'schema', 'bookmark', or 'all'.
+    Returns normalized conflict marker target filter: 'lineage', 'logical_id', 'schema', 'bookmark', or 'all'.
     Prompts interactively if not provided as CLI argument.
     """
     if args_conflict_type:
         val = args_conflict_type.strip().lower()
         if val in ("1", "lineage", "lineagetag", "lineagetags"):
             return "lineage"
-        elif val in ("2", "schema", "schematag", "schematags"):
+        elif val in ("2", "logical", "logicalid", "logicalids"):
+            return "logical_id"
+        elif val in ("3", "schema", "schematag", "schematags"):
             return "schema"
-        elif val in ("3", "bookmark", "id", "hash"):
+        elif val in ("4", "bookmark", "id", "hash"):
             return "bookmark"
-        elif val in ("4", "all", "rest", "both"):
+        elif val in ("5", "all", "rest", "both"):
             return "all"
 
     print("\nSelect target property filter for Git Conflict Markers:")
     print(" 1 - LineageTags (lineageTag, sourceLineageTag)")
-    print(" 2 - SchemaTags ($schema: \"https://...\")")
-    print(" 3 - Bookmark / Object Name IDs (\"name\": \"<hex-hash>\")")
-    print(" 4 - All Conflict Markers (LineageTags, SchemaTags, Bookmark IDs & All Other Conflicts)")
+    print(" 2 - LogicalIds (logicalId, sourceLogicalId)")
+    print(" 3 - SchemaTags ($schema: \"https://...\")")
+    print(" 4 - Bookmark / Object Name IDs (\"name\": \"<hex-hash>\")")
+    print(" 5 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs & All Other Conflicts)")
     while True:
-        choice = input("Enter option (1, 2, 3, or 4): ").strip()
+        choice = input("Enter option (1, 2, 3, 4, or 5): ").strip()
         if choice == "1":
             return "lineage"
         elif choice == "2":
-            return "schema"
+            return "logical_id"
         elif choice == "3":
-            return "bookmark"
+            return "schema"
         elif choice == "4":
+            return "bookmark"
+        elif choice == "5":
             return "all"
-        print("Invalid input. Please enter 1, 2, 3, or 4.\n")
+        print("Invalid input. Please enter 1, 2, 3, 4, or 5.\n")
 
 
 def get_target_object_type(args_type: Optional[str]) -> str:
@@ -1011,7 +1028,15 @@ def run_mode_1_conflict_markers(
                 source_lines = conflict.incoming_lines if selected_option == "1P" else conflict.head_lines
 
                 extracted_tag_line = None
-                pat = TAG_PATTERN if conflict_target_type == "lineage" else BOOKMARK_ID_PATTERN if conflict_target_type == "bookmark" else SCHEMA_PATTERN
+                if conflict_target_type == "lineage":
+                    pat = TAG_PATTERN
+                elif conflict_target_type == "logical_id":
+                    pat = LOGICAL_ID_PATTERN
+                elif conflict_target_type == "bookmark":
+                    pat = BOOKMARK_ID_PATTERN
+                else:
+                    pat = SCHEMA_PATTERN
+
                 for l in source_lines:
                     if pat.match(l):
                         extracted_tag_line = l
@@ -1387,7 +1412,7 @@ def get_action_mode(args_mode: Optional[str]) -> str:
     print(CLR_BOLD + "               Power BI PBIP Master Conflict & Duplicate Resolver" + CLR_RESET)
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
     print("Select resolution action to perform:")
-    print(" 1 - Resolve Git Conflict Markers (lineageTag, $schema, bookmark IDs, and all conflict markers)")
+    print(" 1 - Resolve Git Conflict Markers (lineageTag, logicalId, $schema, bookmark IDs, and all conflict markers)")
     print(" 2 - Resolve Duplicate Objects (Columns, Expressions, Relationships)")
     print(" 3 - Full Combo Mode (Run Mode 1 then Mode 2 sequentially)")
     print(" 4 - Power BI PBIP Metadata Health & Diagnostic Check (Scan for all remaining issues)")
@@ -1469,8 +1494,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--conflict-type",
-        choices=["1", "2", "3", "4", "lineage", "schema", "bookmark", "all"],
-        help="Target property filter for Mode 1 conflict markers: 1/lineage, 2/schema, 3/bookmark, 4/all.",
+        choices=["1", "2", "3", "4", "5", "lineage", "logical", "schema", "bookmark", "all"],
+        help="Target property filter for Mode 1 conflict markers: 1/lineage, 2/logical, 3/schema, 4/bookmark, 5/all.",
     )
     parser.add_argument(
         "--type",
