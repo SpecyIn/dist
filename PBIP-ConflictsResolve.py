@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Power BI PBIP All-in-One Conflict & Duplicate Resolver (PBIP-ConflictsResolve.py).
+Power BI PBIP All-in-One Conflict, Duplicate & Health Resolver (PBIP-ConflictsResolve.py).
 
-Combines Git Conflict Marker resolution (lineageTag / sourceLineageTag) and Duplicate Object
-deduplication (columns, expressions, relationships) into a single, self-contained Python script.
+Combines Git Conflict Marker resolution, Duplicate Object deduplication, and Metadata Diagnostic Check
+into a single, self-contained Python script.
 
 Capabilities:
-1. Mode 1: Resolve Git Conflict Markers (<<<<<<<, =======, >>>>>>>) for lineageTag / sourceLineageTag lines.
+1. Mode 1: Resolve Git Conflict Markers (<<<<<<<, =======, >>>>>>>).
+   - Option 1: LineageTags (lineageTag, sourceLineageTag)
+   - Option 2: SchemaTags ($schema: "https://...")
+   - Option 3: All Conflict Markers (LineageTags, SchemaTags & All Other Conflicts)
 2. Mode 2: Deduplicate Objects (Columns, Expressions, Relationships) when conflict markers are absent (e.g. Accept Both Changes).
-3. Mode 3: Full Combo (Run Mode 1 then Mode 2 sequentially).
+3. Mode 3: Full Combo Mode (Run Mode 1 then Mode 2 sequentially).
+4. Mode 4: Power BI PBIP Metadata Health & Diagnostic Check (Scans for all remaining issues).
 
-Advanced Checks & Features:
-- Reverse Relationship Duplicate Detection: Detects relationships connecting the same two columns regardless of order (fromA->toB vs fromB->toA).
-- Column Reference Normalization: Strips quotes and extra spaces so unquoted and quoted column references match.
+Features:
+- Reverse Relationship Duplicate Detection (fromA->toB vs fromB->toA).
+- Column Reference Normalization (strips quotes & extra spaces).
 - Automatic Blank Line Cleanup: Collapses multiple consecutive empty lines resulting from deleted blocks.
 - ANSI Color Highlighting and Diff Summaries.
 - Case-insensitive Windows Path Resolution & Git History Lookup (git show HEAD).
@@ -23,6 +27,7 @@ Advanced Checks & Features:
 
 import argparse
 import difflib
+import json
 import os
 import re
 import subprocess
@@ -86,6 +91,14 @@ class FileTask:
 
 
 @dataclass
+class DiagnosticIssue:
+    file_path: Path
+    issue_type: str  # "Git Conflict Marker", "Duplicate Object", "JSON Syntax Error", "Missing LineageTag"
+    description: str
+    line_no: Optional[int] = None
+
+
+@dataclass
 class SummaryStats:
     files_scanned: int = 0
     files_modified: int = 0
@@ -113,6 +126,12 @@ OBJECT_KEYWORDS = re.compile(
 # Regex to match lineageTag or sourceLineageTag property lines with optional quotes
 TAG_PATTERN = re.compile(
     r'^\s*["\']?(lineageTag|sourceLineageTag)["\']?\s*:\s*(.+)$',
+    re.IGNORECASE
+)
+
+# Regex to match $schema property lines with optional quotes
+SCHEMA_PATTERN = re.compile(
+    r'^\s*["\']?\$schema["\']?\s*:\s*(.+)$',
     re.IGNORECASE
 )
 
@@ -533,10 +552,14 @@ def extract_column_blocks(lines: List[str]) -> List[ColumnBlock]:
     return blocks
 
 
-def parse_git_conflict_blocks(lines: List[str]) -> List[ConflictMarkerBlock]:
+def parse_git_conflict_blocks(
+    lines: List[str], tag_filter: str = "all"
+) -> List[ConflictMarkerBlock]:
     """
-    Finds all Git conflict blocks (<<<<<<<, =======, >>>>>>>) that contain
-    lineageTag or sourceLineageTag property lines.
+    Finds Git conflict blocks (<<<<<<<, =======, >>>>>>>) filtered by tag_filter:
+    - 'lineage': blocks containing lineageTag or sourceLineageTag
+    - 'schema': blocks containing $schema
+    - 'all': any conflict block (LineageTags, SchemaTags, and all other conflicts)
     """
     conflict_blocks: List[ConflictMarkerBlock] = []
     i = 0
@@ -569,7 +592,16 @@ def parse_git_conflict_blocks(lines: List[str]) -> List[ConflictMarkerBlock]:
                 inc_lines = lines[sep_idx + 1:end_idx]
 
                 all_block_lines = head_lines + inc_lines
-                if any(TAG_PATTERN.match(l) for l in all_block_lines):
+
+                should_include = False
+                if tag_filter == "lineage":
+                    should_include = any(TAG_PATTERN.match(l) for l in all_block_lines)
+                elif tag_filter == "schema":
+                    should_include = any(SCHEMA_PATTERN.match(l) for l in all_block_lines)
+                elif tag_filter == "all":
+                    should_include = True
+
+                if should_include:
                     conflict_blocks.append(ConflictMarkerBlock(
                         start_line=start_idx,
                         sep_line=sep_idx,
@@ -593,7 +625,6 @@ def group_duplicate_columns(
 ) -> Dict[Tuple[str, str], List[ColumnBlock]]:
     """
     Groups object blocks by canonical key and filters by target_object_type.
-    For relationships, matches reverse duplicates (fromA->toB and fromB->toA) using canonical column pair keys.
     """
     grouped: Dict[Tuple[str, str], List[ColumnBlock]] = {}
     for block in blocks:
@@ -631,9 +662,38 @@ def should_process_file(file_path: Path, extensions: Optional[Set[str]]) -> bool
     return ext in extensions
 
 
+def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
+    """
+    Returns normalized conflict marker target filter: 'lineage', 'schema', or 'all'.
+    Prompts interactively if not provided as CLI argument.
+    """
+    if args_conflict_type:
+        val = args_conflict_type.strip().lower()
+        if val in ("1", "lineage", "lineagetag", "lineagetags"):
+            return "lineage"
+        elif val in ("2", "schema", "schematag", "schematags"):
+            return "schema"
+        elif val in ("3", "all", "rest", "both"):
+            return "all"
+
+    print("\nSelect target property filter for Git Conflict Markers:")
+    print(" 1 - LineageTags (lineageTag, sourceLineageTag)")
+    print(" 2 - SchemaTags ($schema: \"https://...\")")
+    print(" 3 - All Conflict Markers (LineageTags, SchemaTags & All Other Conflicts)")
+    while True:
+        choice = input("Enter option (1, 2, or 3): ").strip()
+        if choice == "1":
+            return "lineage"
+        elif choice == "2":
+            return "schema"
+        elif choice == "3":
+            return "all"
+        print("Invalid input. Please enter 1, 2, or 3.\n")
+
+
 def get_target_object_type(args_type: Optional[str]) -> str:
     """
-    Returns normalized target object type: 'column', 'expression', 'relationship', or 'all'.
+    Returns normalized target object type for Mode 2: 'column', 'expression', 'relationship', or 'all'.
     """
     if args_type:
         val = args_type.strip().lower()
@@ -646,7 +706,7 @@ def get_target_object_type(args_type: Optional[str]) -> str:
         elif val in ("4", "all", "both"):
             return "all"
 
-    print("\nSelect target object type to process:")
+    print("\nSelect target object type to process (Mode 2):")
     print(" 1 - Columns")
     print(" 2 - Expressions")
     print(" 3 - Relationships")
@@ -665,13 +725,13 @@ def get_target_object_type(args_type: Optional[str]) -> str:
 
 
 def run_mode_1_conflict_markers(
-    target_files: List[Path], dry_run: bool, auto_keep_state: List[Optional[str]], stats: SummaryStats
+    target_files: List[Path], conflict_target_type: str, dry_run: bool, auto_keep_state: List[Optional[str]], stats: SummaryStats
 ) -> None:
     """
-    Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) for lineageTag / sourceLineageTag lines.
+    Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) filtered by conflict_target_type.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
-    print(CLR_BOLD + "  MODE 1: Resolving Git Conflict Markers (lineageTag / sourceLineageTag)" + CLR_RESET)
+    print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
 
     for file_idx, file_path in enumerate(target_files, 1):
@@ -695,7 +755,7 @@ def run_mode_1_conflict_markers(
             continue
 
         lines = content.splitlines(keepends=True)
-        conflicts = parse_git_conflict_blocks(lines)
+        conflicts = parse_git_conflict_blocks(lines, tag_filter=conflict_target_type)
         if not conflicts:
             continue
 
@@ -793,6 +853,111 @@ def run_mode_2_dedupe_objects(
         process_file_task(
             task, file_idx, total_files, dry_run, auto_keep_state, global_remaining, stats
         )
+
+
+def run_mode_4_metadata_diagnostic(target_files: List[Path]) -> List[DiagnosticIssue]:
+    """
+    Mode 4: Performs a comprehensive Power BI PBIP Metadata & Health Validation Check.
+    Scans files for remaining conflict markers, duplicate objects, JSON syntax errors, and missing lineageTags.
+    """
+    print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
+    print(CLR_BOLD + "  MODE 4: Power BI PBIP Metadata & Health Validation Diagnostic Check" + CLR_RESET)
+    print(CLR_CYAN + "================================================================================" + CLR_RESET)
+
+    issues: List[DiagnosticIssue] = []
+    files_scanned = 0
+
+    for file_path in target_files:
+        try:
+            with open(file_path, "rb") as f:
+                chunk = f.read(8192)
+                if b"\x00" in chunk:
+                    continue
+                f.seek(0)
+                raw_bytes = f.read()
+        except Exception:
+            continue
+
+        has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
+        try:
+            content = (raw_bytes[3:] if has_bom else raw_bytes).decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+
+        files_scanned += 1
+        lines = content.splitlines(keepends=True)
+
+        # 1. Check for remaining Git Conflict Markers
+        for idx, line in enumerate(lines, 1):
+            s = line.strip()
+            if s.startswith("<<<<<<<") or s.startswith("=======") or s.startswith(">>>>>>>"):
+                issues.append(DiagnosticIssue(
+                    file_path=file_path,
+                    issue_type="Git Conflict Marker",
+                    description=f"Unresolved conflict marker line: '{s[:40]}'",
+                    line_no=idx
+                ))
+
+        # 2. Check for remaining Duplicate Objects
+        blocks = extract_column_blocks(lines)
+        duplicate_groups = group_duplicate_columns(blocks, target_object_type="all")
+        for (obj_type, _), dups in duplicate_groups.items():
+            obj_name = dups[0].col_name
+            issues.append(DiagnosticIssue(
+                file_path=file_path,
+                issue_type="Duplicate Object",
+                description=f"Duplicate {obj_type} definition found: '{obj_name}' ({len(dups)} occurrences)",
+                line_no=dups[0].start_line + 1
+            ))
+
+        # 3. Check for JSON Syntax Errors in report/definition files
+        if file_path.suffix.lower() in (".json", ".pbir", ".pbip"):
+            try:
+                json.loads(content)
+            except json.JSONDecodeError as e:
+                issues.append(DiagnosticIssue(
+                    file_path=file_path,
+                    issue_type="JSON Syntax Error",
+                    description=f"JSON parse error: {e.msg} at line {e.lineno}, col {e.colno}",
+                    line_no=e.lineno
+                ))
+
+        # 4. Check for missing LineageTags in TMDL column blocks
+        if file_path.suffix.lower() == ".tmdl":
+            for b in blocks:
+                if b.obj_type == "column":
+                    lt, slt = extract_lineage_tags(b.lines)
+                    if not lt and not slt:
+                        issues.append(DiagnosticIssue(
+                            file_path=file_path,
+                            issue_type="Missing LineageTag",
+                            description=f"Column '{b.col_name}' has no lineageTag or sourceLineageTag property",
+                            line_no=b.start_line + 1
+                        ))
+
+    # Output Diagnostic Report
+    print(f"\nFiles Scanned: {files_scanned} file(s)")
+
+    if not issues:
+        print(f"\n{CLR_GREEN}[OK] HEALTH CHECK PASSED! No metadata issues or conflict errors detected.{CLR_RESET}")
+    else:
+        print(f"\n{CLR_RED}[FAILED] HEALTH CHECK FAILED! Found {len(issues)} metadata issue(s):{CLR_RESET}\n")
+
+        issue_counts: Dict[str, int] = {}
+        for iss in issues:
+            issue_counts[iss.issue_type] = issue_counts.get(iss.issue_type, 0) + 1
+
+        for itype, count in issue_counts.items():
+            print(f"  • {itype}: {CLR_YELLOW}{count} issue(s){CLR_RESET}")
+
+        print("\n" + "-" * 60)
+        print("Detailed Issue List:")
+        for idx, iss in enumerate(issues, 1):
+            line_str = f"Line {iss.line_no}" if iss.line_no else "File-level"
+            print(f"  [{idx}] {CLR_CYAN}{iss.file_path}{CLR_RESET}:{line_str}")
+            print(f"      {CLR_RED}[{iss.issue_type}]{CLR_RESET} {iss.description}")
+
+    return issues
 
 
 def scan_and_prepare_tasks(
@@ -996,7 +1161,7 @@ def process_file_task(
 
 def get_action_mode(args_mode: Optional[str]) -> str:
     """
-    Returns action mode: '1' (Conflict Markers), '2' (Deduplicate Objects), or '3' (Full Combo).
+    Returns action mode: '1' (Conflict Markers), '2' (Deduplicate Objects), '3' (Full Combo), or '4' (Metadata Diagnostic Check).
     """
     if args_mode:
         val = args_mode.strip().lower()
@@ -1006,19 +1171,22 @@ def get_action_mode(args_mode: Optional[str]) -> str:
             return "2"
         elif val in ("3", "combo", "all", "full"):
             return "3"
+        elif val in ("4", "diag", "diagnostic", "check", "health"):
+            return "4"
 
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + "               Power BI PBIP Master Conflict & Duplicate Resolver" + CLR_RESET)
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
     print("Select resolution action to perform:")
-    print(" 1 - Resolve Git Conflict Markers (lineageTag / sourceLineageTag <<<<<<< ======= >>>>>>>)")
+    print(" 1 - Resolve Git Conflict Markers (lineageTag, $schema, and all conflict markers)")
     print(" 2 - Resolve Duplicate Objects (Columns, Expressions, Relationships)")
     print(" 3 - Full Combo Mode (Run Mode 1 then Mode 2 sequentially)")
+    print(" 4 - Power BI PBIP Metadata Health & Diagnostic Check (Scan for all remaining issues)")
     while True:
-        choice = input("Enter option (1, 2, or 3): ").strip()
-        if choice in ("1", "2", "3"):
+        choice = input("Enter option (1, 2, 3, or 4): ").strip()
+        if choice in ("1", "2", "3", "4"):
             return choice
-        print("Invalid input. Please enter 1, 2, or 3.\n")
+        print("Invalid input. Please enter 1, 2, 3, or 4.\n")
 
 
 def main() -> None:
@@ -1032,13 +1200,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["1", "2", "3", "conflict", "dedupe", "combo"],
-        help="Action mode: 1 (Conflict Markers), 2 (Deduplicate Objects), 3 (Full Combo).",
+        choices=["1", "2", "3", "4", "conflict", "dedupe", "combo", "diag"],
+        help="Action mode: 1 (Conflict Markers), 2 (Deduplicate Objects), 3 (Full Combo), 4 (Metadata Diagnostic).",
+    )
+    parser.add_argument(
+        "--conflict-type",
+        choices=["1", "2", "3", "lineage", "schema", "all"],
+        help="Target property filter for Mode 1 conflict markers: 1/lineage, 2/schema, 3/all.",
     )
     parser.add_argument(
         "--type",
         choices=["1", "2", "3", "4", "column", "expression", "relationship", "all"],
-        help="Target object type for Mode 2: 1/column, 2/expression, 3/relationship, or 4/all.",
+        help="Target object type for Mode 2 deduplication: 1/column, 2/expression, 3/relationship, 4/all.",
     )
     parser.add_argument(
         "--dry-run",
@@ -1106,8 +1279,13 @@ def main() -> None:
         print(f"Error: Path '{target_path}' is neither a file nor a directory.", file=sys.stderr)
         sys.exit(1)
 
+    if mode == "4":
+        run_mode_4_metadata_diagnostic(target_files)
+        return
+
     if mode in ("1", "3"):
-        run_mode_1_conflict_markers(target_files, args.dry_run, auto_keep_state, stats)
+        conflict_target_type = get_conflict_target_type(args.conflict_type)
+        run_mode_1_conflict_markers(target_files, conflict_target_type, args.dry_run, auto_keep_state, stats)
 
     if mode in ("2", "3"):
         target_object_type = get_target_object_type(args.type)
@@ -1133,5 +1311,4 @@ if __name__ == "__main__":
 
 # Example usage:
 # python PBIP-ConflictsResolve.py
-# python PBIP-ConflictsResolve.py "C:/path/to/model"
-# python PBIP-ConflictsResolve.py "C:/path/to/model" --mode 3
+# python PBIP-ConflictsResolve.py "C:/path/to/report" --mode 4
