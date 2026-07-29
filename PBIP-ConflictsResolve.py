@@ -11,7 +11,7 @@ Capabilities:
    - Option 2: SchemaTags ($schema: "https://...")
    - Option 3: Bookmark / Object Name IDs ("name": "<hex-hash>")
      - Same Content + Different Name: Resolves bookmark ID cleanly.
-     - Different Content + Different Name: Detects content divergence, warns user, and offers Option 1 (Incoming), Option 2 (Current), or Skip (leave untouched).
+     - Different Content + Different Name: Detects content divergence, pauses 1A auto-keep, and ALWAYS prompts user to accept Option 1 (Incoming), Option 2 (Current), or Skip.
      - Optional Cross-Reference Propagation.
    - Option 4: All Conflict Markers (LineageTags, SchemaTags, Bookmark IDs & All Other Conflicts)
    - Pure vs Mixed Conflict Detection: Detects whether a conflict block contains ONLY target properties or mixed changes.
@@ -841,7 +841,7 @@ def run_mode_1_conflict_markers(
     """
     Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) filtered by conflict_target_type.
     Performs global cross-reference hash propagation ONLY if propagate_refs is True.
-    Detects when bookmark name is different AND content is also different, prompting user to keep Incoming, Current, or Skip.
+    When bookmark content is DIFFERENT, ALWAYS prompts the user (overriding 1A/2A auto-keep for safe manual decision).
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
@@ -886,10 +886,11 @@ def run_mode_1_conflict_markers(
             stats.conflicts_found += 1
             is_pure = is_pure_property_conflict(conflict, conflict_target_type)
             same_bookmark_content = is_bookmark_content_same(conflict) if conflict_target_type == "bookmark" else True
+            is_divergent = (conflict_target_type == "bookmark" and not same_bookmark_content)
 
             print("\n" + CLR_BOLD + f"Conflict {c_idx} of {num_conflicts} (Lines {conflict.start_line + 1}-{conflict.end_line + 1}):" + CLR_RESET)
             
-            if conflict_target_type == "bookmark" and not same_bookmark_content:
+            if is_divergent:
                 print(f"{CLR_RED}  [!] BOOKMARK DIVERGENCE DETECTED: Name is DIFFERENT AND Content/Properties are ALSO DIFFERENT!{CLR_RESET}")
             elif not is_pure:
                 print(f"{CLR_YELLOW}  [!] MIXED CONFLICT: Block contains {conflict_target_type.upper()} AND other code/visual changes!{CLR_RESET}")
@@ -903,22 +904,23 @@ def run_mode_1_conflict_markers(
 
             selected_option = None  # "1", "2", "1P", "2P", "s"
 
-            if auto_keep_state[0] == "first":
+            # Auto-keep 1A/2A applies ONLY if NOT divergent! Divergent conflicts ALWAYS prompt user.
+            if auto_keep_state[0] == "first" and not is_divergent:
                 selected_option = "1"
                 print("  [AUTO-KEEP 1A] Selected Option 1 (Incoming Change)")
-            elif auto_keep_state[0] == "last":
+            elif auto_keep_state[0] == "last" and not is_divergent:
                 selected_option = "2"
                 print("  [AUTO-KEEP 2A] Selected Option 2 (Current Branch)")
             else:
                 while True:
-                    if conflict_target_type == "bookmark" and not same_bookmark_content:
+                    if is_divergent:
                         prompt_msg = (
                             f"Select option for DIFFERENT-CONTENT Bookmark conflict:\n"
                             "  1  = Accept Option 1 [Incoming Change Bookmark]\n"
-                            "  2  = Accept Option 2 [Current Branch Bookmark]\n"
-                            "  1A = Accept Option 1 for ALL remaining conflicts\n"
-                            "  2A = Accept Option 2 for ALL remaining conflicts\n"
-                            "  s  = Skip (Do NOT touch, leave conflict untouched for manual review): "
+                            "  2  = Accept Option 2 [Current Branch / HEAD Bookmark]\n"
+                            "  1A = Accept Option 1 for all remaining conflicts\n"
+                            "  2A = Accept Option 2 for all remaining conflicts\n"
+                            "  s  = Skip (Do NOT touch, leave conflict untouched): "
                         )
                     elif is_pure:
                         prompt_msg = (
@@ -949,10 +951,10 @@ def run_mode_1_conflict_markers(
                     elif choice == "2":
                         selected_option = "2"
                         break
-                    elif choice in ("1p", "p1") and not is_pure:
+                    elif choice in ("1p", "p1") and not is_pure and not is_divergent:
                         selected_option = "1P"
                         break
-                    elif choice in ("2p", "p2") and not is_pure:
+                    elif choice in ("2p", "p2") and not is_pure and not is_divergent:
                         selected_option = "2P"
                         break
                     elif choice in ("1a", "a1", "all1"):
