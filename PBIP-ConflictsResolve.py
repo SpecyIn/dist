@@ -9,14 +9,16 @@ Capabilities:
 1. Mode 1: Resolve Git Conflict Markers (<<<<<<<, =======, >>>>>>>).
    - Option 1: LineageTags (lineageTag, sourceLineageTag)
    - Option 2: SchemaTags ($schema: "https://...")
-   - Option 3: All Conflict Markers (LineageTags, SchemaTags & All Other Conflicts)
-   - Pure vs Mixed Conflict Detection: Detects whether a conflict block contains ONLY target properties or mixed changes (visuals/expressions).
-   - Partial Fix Options (1P / 2P): Resolves ONLY the lineageTag / $schema line while preserving Git conflict markers around visual/expression changes!
+   - Option 3: Bookmark / Object Name IDs ("name": "<hex-hash>") with Cross-Reference Propagation
+   - Option 4: All Conflict Markers (LineageTags, SchemaTags, Bookmark IDs & All Other Conflicts)
+   - Pure vs Mixed Conflict Detection: Detects whether a conflict block contains ONLY target properties or mixed changes.
+   - Partial Fix Options (1P / 2P): Resolves ONLY the target property line while preserving Git conflict markers around visual/expression changes!
 2. Mode 2: Deduplicate Objects (Columns, Expressions, Relationships) when conflict markers are absent (e.g. Accept Both Changes).
 3. Mode 3: Full Combo Mode (Run Mode 1 then Mode 2 sequentially).
 4. Mode 4: Power BI PBIP Metadata Health & Diagnostic Check (Scans for all remaining issues).
 
 Features:
+- Global Cross-Reference Propagation: Automatically updates references of discarded Bookmark / Object ID hashes across all project files.
 - Scoped Auto-Resolve (1A / 2A): '1A' or '2A' applies strictly to the currently selected property filter/category.
 - Interactive Navigation Loop: Returns to the Main Menu after completing tasks.
 - Reverse Relationship Duplicate Detection (fromA->toB vs fromB->toA).
@@ -138,6 +140,12 @@ SCHEMA_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Regex to match bookmark / object name ID hash lines (e.g. "name": "bfc96ab435b50ee1cd8d",)
+BOOKMARK_ID_PATTERN = re.compile(
+    r'^\s*["\']?name["\']?\s*:\s*["\']([0-9a-fA-F]{8,64})["\']\s*,?\s*$',
+    re.IGNORECASE
+)
+
 # Regex to match fromColumn and toColumn in relationships
 FROM_COL_PATTERN = re.compile(r'^\s*["\']?fromColumn["\']?\s*:\s*(.+)$', re.IGNORECASE)
 TO_COL_PATTERN = re.compile(r'^\s*["\']?toColumn["\']?\s*:\s*(.+)$', re.IGNORECASE)
@@ -211,6 +219,8 @@ def is_pure_property_conflict(conflict: ConflictMarkerBlock, tag_filter: str) ->
         return all(TAG_PATTERN.match(l) for l in all_lines)
     elif tag_filter == "schema":
         return all(SCHEMA_PATTERN.match(l) for l in all_lines)
+    elif tag_filter == "bookmark":
+        return all(BOOKMARK_ID_PATTERN.match(l) for l in all_lines)
 
     return True
 
@@ -578,7 +588,8 @@ def parse_git_conflict_blocks(
     Finds Git conflict blocks (<<<<<<<, =======, >>>>>>>) filtered by tag_filter:
     - 'lineage': blocks containing lineageTag or sourceLineageTag
     - 'schema': blocks containing $schema
-    - 'all': any conflict block (LineageTags, SchemaTags, and all other conflicts)
+    - 'bookmark': blocks containing "name": "<hex-hash>"
+    - 'all': any conflict block (LineageTags, SchemaTags, Bookmark IDs, and all other conflicts)
     """
     conflict_blocks: List[ConflictMarkerBlock] = []
     i = 0
@@ -617,6 +628,8 @@ def parse_git_conflict_blocks(
                     should_include = any(TAG_PATTERN.match(l) for l in all_block_lines)
                 elif tag_filter == "schema":
                     should_include = any(SCHEMA_PATTERN.match(l) for l in all_block_lines)
+                elif tag_filter == "bookmark":
+                    should_include = any(BOOKMARK_ID_PATTERN.match(l) for l in all_block_lines)
                 elif tag_filter == "all":
                     should_include = True
 
@@ -637,6 +650,40 @@ def parse_git_conflict_blocks(
             i += 1
 
     return conflict_blocks
+
+
+def propagate_hash_replacement(target_files: List[Path], old_hash: str, new_hash: str) -> int:
+    """
+    Scans all project files and updates cross-references from old_hash to new_hash.
+    Returns the total count of cross-reference replacements made across all files.
+    """
+    if not old_hash or not new_hash or old_hash == new_hash:
+        return 0
+
+    replacements_made = 0
+    for file_path in target_files:
+        try:
+            with open(file_path, "rb") as f:
+                raw_bytes = f.read()
+            has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
+            content = (raw_bytes[3:] if has_bom else raw_bytes).decode("utf-8")
+        except Exception:
+            continue
+
+        if old_hash in content:
+            count = content.count(old_hash)
+            new_content = content.replace(old_hash, new_hash)
+            encoded = new_content.encode("utf-8")
+            if has_bom:
+                encoded = b"\xef\xbb\xbf" + encoded
+            try:
+                with open(file_path, "wb") as f:
+                    f.write(encoded)
+                replacements_made += count
+            except Exception:
+                pass
+
+    return replacements_made
 
 
 def group_duplicate_columns(
@@ -683,7 +730,7 @@ def should_process_file(file_path: Path, extensions: Optional[Set[str]]) -> bool
 
 def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
     """
-    Returns normalized conflict marker target filter: 'lineage', 'schema', or 'all'.
+    Returns normalized conflict marker target filter: 'lineage', 'schema', 'bookmark', or 'all'.
     Prompts interactively if not provided as CLI argument.
     """
     if args_conflict_type:
@@ -692,22 +739,27 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
             return "lineage"
         elif val in ("2", "schema", "schematag", "schematags"):
             return "schema"
-        elif val in ("3", "all", "rest", "both"):
+        elif val in ("3", "bookmark", "id", "hash"):
+            return "bookmark"
+        elif val in ("4", "all", "rest", "both"):
             return "all"
 
     print("\nSelect target property filter for Git Conflict Markers:")
     print(" 1 - LineageTags (lineageTag, sourceLineageTag)")
     print(" 2 - SchemaTags ($schema: \"https://...\")")
-    print(" 3 - All Conflict Markers (LineageTags, SchemaTags & All Other Conflicts)")
+    print(" 3 - Bookmark / Object Name IDs (\"name\": \"<hex-hash>\")")
+    print(" 4 - All Conflict Markers (LineageTags, SchemaTags, Bookmark IDs & All Other Conflicts)")
     while True:
-        choice = input("Enter option (1, 2, or 3): ").strip()
+        choice = input("Enter option (1, 2, 3, or 4): ").strip()
         if choice == "1":
             return "lineage"
         elif choice == "2":
             return "schema"
         elif choice == "3":
+            return "bookmark"
+        elif choice == "4":
             return "all"
-        print("Invalid input. Please enter 1, 2, or 3.\n")
+        print("Invalid input. Please enter 1, 2, 3, or 4.\n")
 
 
 def get_target_object_type(args_type: Optional[str]) -> str:
@@ -748,8 +800,7 @@ def run_mode_1_conflict_markers(
 ) -> None:
     """
     Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) filtered by conflict_target_type.
-    Detects pure vs mixed conflicts and supports Partial Fix (1P / 2P) to isolate property lines
-    without destroying visual/expression changes.
+    Performs global cross-reference hash propagation for Bookmark / Object ID hash replacements.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
@@ -865,26 +916,46 @@ def run_mode_1_conflict_markers(
                 lines_to_delete.add(conflict.end_line)
                 selected_lines = conflict.incoming_lines if selected_option == "1" else conflict.head_lines
                 unselected = conflict.head_lines if selected_option == "1" else conflict.incoming_lines
+
                 for un_idx, un_line in enumerate(lines):
                     if un_line in unselected and conflict.start_line < un_idx < conflict.end_line:
                         lines_to_delete.add(un_idx)
+
+                # Extract and propagate hash replacement across all project files if resolving Bookmark / Object ID conflict
+                if conflict_target_type == "bookmark" or (conflict_target_type == "all" and is_pure):
+                    kept_hash = None
+                    discarded_hash = None
+
+                    for l in selected_lines:
+                        m = BOOKMARK_ID_PATTERN.match(l)
+                        if m:
+                            kept_hash = m.group(1)
+                            break
+
+                    for l in unselected:
+                        m = BOOKMARK_ID_PATTERN.match(l)
+                        if m:
+                            discarded_hash = m.group(1)
+                            break
+
+                    if kept_hash and discarded_hash and kept_hash != discarded_hash:
+                        refs_updated = propagate_hash_replacement(target_files, discarded_hash, kept_hash)
+                        if refs_updated > 0:
+                            print(f"{CLR_GREEN}--> Propagated Bookmark/Object ID Hash: Updated {refs_updated} cross-references of '{discarded_hash}' to '{kept_hash}'.{CLR_RESET}")
 
             elif selected_option in ("1P", "2P"):
                 stats.conflicts_resolved += 1
                 source_lines = conflict.incoming_lines if selected_option == "1P" else conflict.head_lines
 
                 extracted_tag_line = None
-                pat = TAG_PATTERN if conflict_target_type == "lineage" else SCHEMA_PATTERN
+                pat = TAG_PATTERN if conflict_target_type == "lineage" else BOOKMARK_ID_PATTERN if conflict_target_type == "bookmark" else SCHEMA_PATTERN
                 for l in source_lines:
                     if pat.match(l):
                         extracted_tag_line = l
                         break
 
                 if extracted_tag_line:
-                    # Place extracted property line directly ABOVE the remaining conflict block
                     partial_insertions[conflict.start_line] = [extracted_tag_line]
-
-                    # Remove tag lines from inside both head_lines and incoming_lines
                     for idx in range(conflict.start_line + 1, conflict.end_line):
                         if pat.match(lines[idx]):
                             lines_to_delete.add(idx)
@@ -1253,7 +1324,7 @@ def get_action_mode(args_mode: Optional[str]) -> str:
     print(CLR_BOLD + "               Power BI PBIP Master Conflict & Duplicate Resolver" + CLR_RESET)
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
     print("Select resolution action to perform:")
-    print(" 1 - Resolve Git Conflict Markers (lineageTag, $schema, and all conflict markers)")
+    print(" 1 - Resolve Git Conflict Markers (lineageTag, $schema, bookmark IDs, and all conflict markers)")
     print(" 2 - Resolve Duplicate Objects (Columns, Expressions, Relationships)")
     print(" 3 - Full Combo Mode (Run Mode 1 then Mode 2 sequentially)")
     print(" 4 - Power BI PBIP Metadata Health & Diagnostic Check (Scan for all remaining issues)")
@@ -1331,8 +1402,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--conflict-type",
-        choices=["1", "2", "3", "lineage", "schema", "all"],
-        help="Target property filter for Mode 1 conflict markers: 1/lineage, 2/schema, 3/all.",
+        choices=["1", "2", "3", "4", "lineage", "schema", "bookmark", "all"],
+        help="Target property filter for Mode 1 conflict markers: 1/lineage, 2/schema, 3/bookmark, 4/all.",
     )
     parser.add_argument(
         "--type",
