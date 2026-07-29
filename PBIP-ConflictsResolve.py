@@ -8,7 +8,7 @@ into a single, self-contained Python script with interactive main menu navigatio
 Capabilities:
 1. Mode 1: Resolve Git Conflict Markers (<<<<<<<, =======, >>>>>>>).
    - Option 1: LineageTags (lineageTag, sourceLineageTag)
-   - Option 2: LogicalIds (logicalId, sourceLogicalId)
+   - Option 2: LogicalIds (logicalId, sourceLogicalId in TMDL, JSON, & .platform files)
    - Option 3: SchemaTags ($schema: "https://...")
    - Option 4: Bookmark / Object Name IDs ("name": "<hex-hash>")
      - Same Content + Different Name: Resolves bookmark ID cleanly.
@@ -22,6 +22,7 @@ Capabilities:
 4. Mode 4: Power BI PBIP Metadata Health & Diagnostic Check (Scans for all remaining issues).
 
 Features:
+- Full Fabric & Power BI PBIP File Support: Includes .tmdl, .json, .pbir, .pbip, .platform, .fabric, .definition, .item, .report files.
 - Performance-Optimized Cross-Reference Propagation: Cross-reference propagation for Bookmark/Object ID hashes is OPTIONAL (default: disabled for maximum speed; prompt or --propagate-refs enables it).
 - Scoped Auto-Resolve (1A / 2A): '1A' or '2A' applies strictly to the currently selected property filter/category.
 - Interactive Navigation Loop: Returns to the Main Menu after completing tasks.
@@ -753,11 +754,12 @@ def parse_extensions(ext_str: Optional[str]) -> Optional[Set[str]]:
 
 
 def should_process_file(file_path: Path, extensions: Optional[Set[str]]) -> bool:
-    """Checks if file extension matches the filter."""
+    """Checks if file extension or filename matches the filter."""
     if extensions is None:
         return True
     ext = file_path.suffix.lstrip(".").lower()
-    return ext in extensions
+    name = file_path.name.lstrip(".").lower()
+    return (ext in extensions) or (name in extensions)
 
 
 def ask_propagate_cross_references(args_propagate: Optional[bool] = None) -> bool:
@@ -1515,8 +1517,8 @@ def main() -> None:
     parser.add_argument(
         "--extensions",
         type=str,
-        default="tmdl,json,pbir,pbip",
-        help="Comma-separated file extensions to process (default: tmdl,json,pbir,pbip). Use 'all' for all text files.",
+        default="tmdl,json,pbir,pbip,platform,fabric,definition,item,report",
+        help="Comma-separated file extensions/names to process (default: tmdl,json,pbir,pbip,platform,fabric,definition,item,report). Use 'all' for all text files.",
     )
     parser.add_argument(
         "--keep-first",
