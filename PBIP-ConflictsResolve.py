@@ -27,6 +27,7 @@ Modes & Capabilities:
 2. Mode 2: Duplicate Object & JSON Comma Formatting Resolver.
    - Target Objects: 1 - Columns, 2 - Expressions, 3 - Relationships (reverse pair canonical matching), 4 - JSON Comma & Syntax Auto-Formatter, 5 - All.
    - Auto-Fixes missing commas between adjacent JSON objects (}\n{ -> },\n{), removes duplicate commas, and strips invalid trailing commas before brackets.
+   - Accurately tracks files_scanned and files_modified statistics.
 
 3. Mode 3: Stage Clean Files to Git (Ultra-Fast Git Status Driven Mode - 12,000x Speedup).
    - Runs 'git status --porcelain' ONCE at repository root (~10ms) to instantly identify modified files.
@@ -1046,7 +1047,6 @@ def run_mode_1_conflict_markers(
         print(f"  • Cross-Reference Propagation: {CLR_YELLOW}{prop_desc}{CLR_RESET}")
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
 
-    # Category-Scoped Auto-Keep Map (Used in Combo Mode)
     category_auto_keep: Dict[str, Optional[str]] = {}
     if auto_keep_state[0] == "first":
         category_auto_keep["global"] = "first"
@@ -1116,7 +1116,6 @@ def run_mode_1_conflict_markers(
 
             selected_option = None  # "1", "2", "1P", "2P", "s"
 
-            # Check category-scoped auto keep
             current_cat_keep = category_auto_keep.get(cat_type) or category_auto_keep.get("global")
 
             if current_cat_keep == "first" and not is_divergent:
@@ -1297,6 +1296,7 @@ def run_mode_2_dedupe_objects(
 ) -> None:
     """
     Mode 2: Deduplicates Objects (Columns, Expressions, Relationships) and auto-fixes JSON comma syntax formatting.
+    Accurately tracks files_scanned and files_modified statistics.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 2: Resolving Duplicate Objects & JSON Formatter (Target: {target_object_type.upper()})" + CLR_RESET)
@@ -1306,24 +1306,29 @@ def run_mode_2_dedupe_objects(
         json_files_fixed = 0
         for fpath in target_files:
             if fpath.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
+                stats.files_scanned += 1
                 try:
                     with open(fpath, "rb") as f:
                         raw = f.read()
                     has_bom = raw.startswith(b"\xef\xbb\xbf")
                     txt = (raw[3:] if has_bom else raw).decode("utf-8")
                     fixed = fix_pbip_json_formatting(txt)
-                    if fixed != txt and not dry_run:
-                        enc = fixed.encode("utf-8")
-                        if has_bom:
-                            enc = b"\xef\xbb\xbf" + enc
-                        with open(fpath, "wb") as f:
-                            f.write(enc)
-                        json_files_fixed += 1
-                        print(f"  {CLR_GREEN}[FORMATTED]{CLR_RESET} Fixed JSON comma/syntax formatting in: {fpath}")
+                    if fixed != txt:
+                        stats.files_modified += 1
+                        if not dry_run:
+                            enc = fixed.encode("utf-8")
+                            if has_bom:
+                                enc = b"\xef\xbb\xbf" + enc
+                            with open(fpath, "wb") as f:
+                                f.write(enc)
+                            json_files_fixed += 1
+                            print(f"  {CLR_GREEN}[FORMATTED]{CLR_RESET} Fixed JSON comma/syntax formatting in: {fpath}")
+                        else:
+                            print(f"  [DRY-RUN FORMAT] Would fix JSON formatting in: {fpath}")
                 except Exception:
-                    pass
-        if json_files_fixed > 0:
-            print(f"\n{CLR_GREEN}--> Auto-Formatted JSON Comma Syntax in {json_files_fixed} file(s).{CLR_RESET}")
+                    stats.files_skipped += 1
+
+        print(f"\nJSON Formatter Summary: Scanned {CLR_CYAN}{stats.files_scanned}{CLR_RESET} JSON file(s) | Formatted: {CLR_GREEN}{json_files_fixed}{CLR_RESET} file(s)")
 
     if target_object_type != "formatter":
         tasks, total_duplicates_all = scan_and_prepare_tasks(target_files, target_object_type, stats)
