@@ -15,6 +15,7 @@ Modes & Capabilities:
      4 - Bookmark / Object Name IDs ("name": "<hex-hash>" in bookmarks.json, page.json, visual.json)
      5 - Additions Only (Detailed sub-filters: Subset Additions [base same + extra], Empty-Side Additions [content vs blank], or All Additions)
      6 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)
+     b - Back to Main Menu
    - Features:
      - Addition Sub-Types (Subset vs Empty-Side): Distinguishes Subset Additions (base content identical + extra lines) from Empty-Side Additions (one branch contains text, other branch is completely empty/blank).
      - Interactive Approval for Additions: Displays addition notices with recommended options (1/2), allowing manual review or bulk category auto-keep (1A/2A).
@@ -26,7 +27,7 @@ Modes & Capabilities:
      - Bulletproof Index-Based Deletion: Immune to line ending (\r\n vs \n) or whitespace differences.
 
 2. Mode 2: Duplicate Object & JSON Comma Formatting Resolver.
-   - Target Objects: 1 - Columns, 2 - Expressions, 3 - Relationships (reverse pair canonical matching), 4 - JSON Comma & Syntax Auto-Formatter, 5 - All.
+   - Target Objects: 1 - Columns, 2 - Expressions, 3 - Relationships (reverse pair canonical matching), 4 - JSON Comma & Syntax Auto-Formatter, 5 - All, b - Back to Main Menu.
    - Auto-Fixes missing commas between adjacent JSON objects (}\n{ -> },\n{), removes duplicate commas, and strips invalid trailing commas before brackets.
    - Accurately tracks files_scanned and files_modified statistics.
 
@@ -44,6 +45,7 @@ Modes & Capabilities:
    - Option [1] is ALWAYS Incoming Change (Top), Option [2] is ALWAYS Current Branch / HEAD (Bottom).
 
 Features & Controls:
+- Sub-Menu Back Navigation: Enter 'b' or '0' at any sub-menu prompt to immediately return to the Main Menu.
 - Category-Scoped 1A/2A (Mode 1 Combo): Auto-resolve (1A/2A) applies strictly per property category (Lineage, LogicalId, Bookmark, Subset Addition, Empty-Side Addition), preventing accidental global overwrites.
 - Ultra-Fast Staging (Mode 3): Single-pass Git status query skips unmodified & already-staged files in 10ms.
 - Live Real-Time Progress: Clear terminal progress feedback ([1/N] Checking...) eliminates perceived hangs.
@@ -985,12 +987,14 @@ def ask_propagate_cross_references(args_propagate: Optional[bool] = None) -> boo
 
 def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
     """
-    Returns normalized conflict marker target filter: 'lineage', 'logical_id', 'schema', 'bookmark', 'subset_addition', 'empty_addition', 'addition', or 'all'.
+    Returns normalized conflict marker target filter: 'lineage', 'logical_id', 'schema', 'bookmark', 'subset_addition', 'empty_addition', 'addition', 'all', or 'back'.
     Prompts interactively if not provided as CLI argument.
     """
     if args_conflict_type:
         val = args_conflict_type.strip().lower()
-        if val in ("1", "lineage", "lineagetag", "lineagetags"):
+        if val in ("b", "back", "0"):
+            return "back"
+        elif val in ("1", "lineage", "lineagetag", "lineagetags"):
             return "lineage"
         elif val in ("2", "logical", "logicalid", "logicalids"):
             return "logical_id"
@@ -1017,9 +1021,12 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
     print("     5.2 - Empty-Side Additions Only (One side contains content, other side is blank/empty)")
     print("     5.3 - All Additions (Both Subset & Empty-Side Additions)")
     print(" 6 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)")
+    print(" b - Back to Main Menu")
     while True:
-        choice = input("Enter option (1, 2, 3, 4, 5, 5.1, 5.2, 5.3, or 6): ").strip().lower()
-        if choice == "1":
+        choice = input("Enter option (1, 2, 3, 4, 5, 5.1, 5.2, 5.3, 6, or b): ").strip().lower()
+        if choice in ("b", "back", "0"):
+            return "back"
+        elif choice == "1":
             return "lineage"
         elif choice == "2":
             return "logical_id"
@@ -1035,16 +1042,18 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
             return "addition"
         elif choice == "6":
             return "all"
-        print("Invalid input. Please enter 1, 2, 3, 4, 5.1, 5.2, 5.3, or 6.\n")
+        print("Invalid input. Please enter 1, 2, 3, 4, 5.1, 5.2, 5.3, 6, or b.\n")
 
 
 def get_target_object_type(args_type: Optional[str]) -> str:
     """
-    Returns normalized target object type for Mode 2: 'column', 'expression', 'relationship', 'formatter', or 'all'.
+    Returns normalized target object type for Mode 2: 'column', 'expression', 'relationship', 'formatter', 'all', or 'back'.
     """
     if args_type:
         val = args_type.strip().lower()
-        if val in ("1", "column", "columns"):
+        if val in ("b", "back", "0"):
+            return "back"
+        elif val in ("1", "column", "columns"):
             return "column"
         elif val in ("2", "expression", "expressions"):
             return "expression"
@@ -1061,9 +1070,12 @@ def get_target_object_type(args_type: Optional[str]) -> str:
     print(" 3 - Relationships")
     print(" 4 - JSON Comma & Syntax Auto-Formatter (Fix missing/duplicate commas resulting from additions)")
     print(" 5 - All (Columns, Expressions, Relationships & Comma Formatting Auto-Fixer)")
+    print(" b - Back to Main Menu")
     while True:
-        choice = input("Enter option (1, 2, 3, 4, or 5): ").strip()
-        if choice == "1":
+        choice = input("Enter option (1, 2, 3, 4, 5, or b): ").strip().lower()
+        if choice in ("b", "back", "0"):
+            return "back"
+        elif choice == "1":
             return "column"
         elif choice == "2":
             return "expression"
@@ -1073,7 +1085,7 @@ def get_target_object_type(args_type: Optional[str]) -> str:
             return "formatter"
         elif choice == "5":
             return "all"
-        print("Invalid input. Please enter 1, 2, 3, 4, or 5.\n")
+        print("Invalid input. Please enter 1, 2, 3, 4, 5, or b.\n")
 
 
 def run_mode_1_conflict_markers(
@@ -2030,6 +2042,8 @@ def run_single_execution(target_path: Path, mode: str, args) -> None:
 
     if mode == "1":
         conflict_target_type = get_conflict_target_type(args.conflict_type)
+        if conflict_target_type == "back":
+            return
         propagate_refs = False
         if conflict_target_type in ("bookmark", "all"):
             propagate_refs = ask_propagate_cross_references(args.propagate_refs if hasattr(args, "propagate_refs") and args.propagate_refs else None)
@@ -2039,6 +2053,8 @@ def run_single_execution(target_path: Path, mode: str, args) -> None:
 
     if mode == "2":
         target_object_type = get_target_object_type(args.type)
+        if target_object_type == "back":
+            return
         auto_keep_m2 = [initial_auto_keep]
         run_mode_2_dedupe_objects(target_files, target_object_type, args.dry_run, auto_keep_m2, stats)
 
@@ -2143,6 +2159,10 @@ def main() -> None:
             run_mode_4_metadata_diagnostic(target_files)
         elif mode == "1":
             conflict_target_type = get_conflict_target_type(args.conflict_type)
+            if conflict_target_type == "back":
+                print(f"\n{CLR_YELLOW}--> Returning to Main Menu...{CLR_RESET}")
+                continue
+
             propagate_refs = False
             if conflict_target_type in ("bookmark", "all"):
                 propagate_refs = ask_propagate_cross_references(args.propagate_refs if hasattr(args, "propagate_refs") and args.propagate_refs else None)
@@ -2154,6 +2174,10 @@ def main() -> None:
             print(f"Conflict markers found: {stats.conflicts_found} | Resolved: {stats.conflicts_resolved} | Skipped: {stats.conflicts_skipped}")
         elif mode == "2":
             target_object_type = get_target_object_type(args.type)
+            if target_object_type == "back":
+                print(f"\n{CLR_YELLOW}--> Returning to Main Menu...{CLR_RESET}")
+                continue
+
             auto_keep_m2 = [initial_auto_keep]
             run_mode_2_dedupe_objects(target_files, target_object_type, args.dry_run, auto_keep_m2, stats)
             print("\n--- Summary ---")
@@ -2166,7 +2190,7 @@ def main() -> None:
             run_mode_5_detailed_conflict_review(target_files, args.dry_run, auto_keep_m5, stats)
             print("\n--- Summary ---")
             print(f"Files scanned: {stats.files_scanned} | Modified: {stats.files_modified}")
-            print(f"Conflict markers found: {stats.conflicts_found} | Resolved: {stats.resolved} | Skipped: {stats.conflicts_skipped}")
+            print(f"Conflict markers found: {stats.conflicts_found} | Resolved: {stats.conflicts_resolved} | Skipped: {stats.conflicts_skipped}")
 
         # Sub-menu navigation return prompt
         print("\n" + CLR_CYAN + "--------------------------------------------------------------------------------" + CLR_RESET)
