@@ -16,6 +16,7 @@ Modes & Capabilities:
      5 - Additions Only (Accepts additions when one side contains all lines of the other side OR when one side is empty)
      6 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)
    - Features:
+     - Category-Scoped Auto-Keep in Combo Mode: In Combo Mode (Option 6), typing 1A or 2A auto-keeps remaining conflicts strictly within THAT conflict category (LineageTags, LogicalIds, SchemaTags, Bookmarks, Additions, etc.) and prompts again when transitioning to a new category.
      - Empty-Side & Subset Addition Detection: Auto-identifies pure additions even when one branch is completely empty.
      - Pure vs Mixed Conflict Detection: Detects single-line property vs mixed visual/expression changes.
      - Partial Fix Options (1P / 2P): Resolves property lines while keeping conflict markers around visual changes.
@@ -41,9 +42,9 @@ Modes & Capabilities:
    - Option [1] is ALWAYS Incoming Change (Top), Option [2] is ALWAYS Current Branch / HEAD (Bottom).
 
 Features & Controls:
+- Category-Scoped 1A/2A (Mode 1 Combo): Auto-resolve (1A/2A) applies strictly per property category (Lineage, LogicalId, Bookmark, Addition), preventing accidental global overwrites across different categories.
 - Ultra-Fast Staging (Mode 3): Single-pass Git status query skips unmodified & already-staged files in 10ms.
 - Live Real-Time Progress: Clear terminal progress feedback ([1/N] Checking...) eliminates perceived hangs.
-- Scoped Auto-Resolve (1A / 2A): '1A' or '2A' applies strictly to the currently selected property filter or object category session.
 - Interactive Navigation Loop: Sub-menu prompt to return to the Main Menu after completing tasks.
 - Full Fabric & Power BI File Support: Scans .tmdl, .json, .pbir, .pbip, .platform, .fabric, .definition, .item, and .report files.
 - Automatic Blank Line Cleanup: Collapses multiple consecutive empty lines resulting from deleted blocks.
@@ -304,6 +305,27 @@ def is_subset_addition(lines_a: List[str], lines_b: List[str]) -> bool:
 
     it = iter(clean_b)
     return all(item in it for item in clean_a) and len(clean_b) > len(clean_a)
+
+
+def detect_conflict_category(conflict: ConflictMarkerBlock) -> str:
+    """
+    Classifies a conflict block into a category:
+    'lineage', 'logical_id', 'schema', 'bookmark', 'addition', or 'other'.
+    """
+    all_block_lines = conflict.head_lines + conflict.incoming_lines
+
+    if any(TAG_PATTERN.match(l) for l in all_block_lines):
+        return "lineage"
+    if any(LOGICAL_ID_PATTERN.match(l) for l in all_block_lines):
+        return "logical_id"
+    if any(SCHEMA_PATTERN.match(l) for l in all_block_lines):
+        return "schema"
+    if any(BOOKMARK_ID_PATTERN.match(l) for l in all_block_lines):
+        return "bookmark"
+    if is_subset_addition(conflict.head_lines, conflict.incoming_lines) or is_subset_addition(conflict.incoming_lines, conflict.head_lines):
+        return "addition"
+
+    return "other"
 
 
 def is_pure_property_conflict(conflict: ConflictMarkerBlock, tag_filter: str) -> bool:
@@ -1014,9 +1036,8 @@ def run_mode_1_conflict_markers(
 ) -> None:
     """
     Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) filtered by conflict_target_type.
-    Performs global cross-reference hash propagation ONLY if propagate_refs is True.
-    When bookmark content is DIFFERENT, ALWAYS prompts the user (overriding 1A/2A auto-keep for safe manual decision).
-    Auto-formats JSON comma syntax after file modification.
+    In Combo Mode (conflict_target_type == "all"), 1A / 2A auto-keep is SCOPED STRICTLY per category
+    (Lineage, LogicalId, Schema, Bookmark, Addition, Other) so typing 1A on LineageTags does NOT auto-accept Bookmarks!
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
@@ -1024,6 +1045,13 @@ def run_mode_1_conflict_markers(
         prop_desc = "ENABLED" if propagate_refs else "DISABLED (FAST MODE)"
         print(f"  • Cross-Reference Propagation: {CLR_YELLOW}{prop_desc}{CLR_RESET}")
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
+
+    # Category-Scoped Auto-Keep Map (Used in Combo Mode)
+    category_auto_keep: Dict[str, Optional[str]] = {}
+    if auto_keep_state[0] == "first":
+        category_auto_keep["global"] = "first"
+    elif auto_keep_state[0] == "last":
+        category_auto_keep["global"] = "last"
 
     for file_idx, file_path in enumerate(target_files, 1):
         try:
@@ -1059,15 +1087,17 @@ def run_mode_1_conflict_markers(
 
         for c_idx, conflict in enumerate(conflicts, 1):
             stats.conflicts_found += 1
-            is_pure = is_pure_property_conflict(conflict, conflict_target_type)
-            same_bookmark_content = is_bookmark_content_same(conflict) if conflict_target_type == "bookmark" else True
-            is_divergent = (conflict_target_type == "bookmark" and not same_bookmark_content)
+
+            cat_type = detect_conflict_category(conflict)
+            is_pure = is_pure_property_conflict(conflict, cat_type if conflict_target_type == "all" else conflict_target_type)
+            same_bookmark_content = is_bookmark_content_same(conflict) if (cat_type == "bookmark" or conflict_target_type == "bookmark") else True
+            is_divergent = (cat_type == "bookmark" and not same_bookmark_content)
 
             inc_has_additions = is_subset_addition(conflict.head_lines, conflict.incoming_lines)
             head_has_additions = is_subset_addition(conflict.incoming_lines, conflict.head_lines)
 
-            print("\n" + CLR_BOLD + f"Conflict {c_idx} of {num_conflicts} (Lines {conflict.start_line + 1}-{conflict.end_line + 1}):" + CLR_RESET)
-            
+            print("\n" + CLR_BOLD + f"Conflict {c_idx} of {num_conflicts} (Category: {cat_type.upper()}, Lines {conflict.start_line + 1}-{conflict.end_line + 1}):" + CLR_RESET)
+
             if inc_has_additions:
                 print(f"{CLR_GREEN}  [+] PURE ADDITION DETECTED: Option 1 [Incoming Change] contains all base lines PLUS new additions!{CLR_RESET}")
             elif head_has_additions:
@@ -1075,7 +1105,7 @@ def run_mode_1_conflict_markers(
             elif is_divergent:
                 print(f"{CLR_RED}  [!] BOOKMARK DIVERGENCE DETECTED: Name is DIFFERENT AND Content/Properties are ALSO DIFFERENT!{CLR_RESET}")
             elif not is_pure:
-                print(f"{CLR_YELLOW}  [!] MIXED CONFLICT: Block contains {conflict_target_type.upper()} AND other code/visual changes!{CLR_RESET}")
+                print(f"{CLR_YELLOW}  [!] MIXED CONFLICT: Block contains {cat_type.upper()} AND other code/visual changes!{CLR_RESET}")
 
             print(f"  Option [1] [{conflict.incoming_label}] (Top):")
             for l in conflict.incoming_lines:
@@ -1086,17 +1116,19 @@ def run_mode_1_conflict_markers(
 
             selected_option = None  # "1", "2", "1P", "2P", "s"
 
-            # Auto-keep 1A/2A applies ONLY if NOT divergent! Divergent conflicts ALWAYS prompt user.
-            if auto_keep_state[0] == "first" and not is_divergent:
+            # Check category-scoped auto keep
+            current_cat_keep = category_auto_keep.get(cat_type) or category_auto_keep.get("global")
+
+            if current_cat_keep == "first" and not is_divergent:
                 selected_option = "1"
-                print("  [AUTO-KEEP 1A] Selected Option 1 (Incoming Change)")
-            elif auto_keep_state[0] == "last" and not is_divergent:
+                print(f"  [AUTO-KEEP 1A ({cat_type.upper()})] Selected Option 1 (Incoming Change)")
+            elif current_cat_keep == "last" and not is_divergent:
                 selected_option = "2"
-                print("  [AUTO-KEEP 2A] Selected Option 2 (Current Branch)")
-            elif inc_has_additions and conflict_target_type == "addition":
+                print(f"  [AUTO-KEEP 2A ({cat_type.upper()})] Selected Option 2 (Current Branch)")
+            elif inc_has_additions and (conflict_target_type == "addition" or cat_type == "addition"):
                 selected_option = "1"
                 print("  [AUTO-ACCEPT ADDITION] Selected Option 1 (Incoming Change - Contains all base lines + additions)")
-            elif head_has_additions and conflict_target_type == "addition":
+            elif head_has_additions and (conflict_target_type == "addition" or cat_type == "addition"):
                 selected_option = "2"
                 print("  [AUTO-ACCEPT ADDITION] Selected Option 2 (Current Branch - Contains all base lines + additions)")
             else:
@@ -1107,8 +1139,8 @@ def run_mode_1_conflict_markers(
                             f"Select option for ADDITION conflict{rec_str}:\n"
                             "  1  = Accept Option 1 [Incoming Change] (Top)\n"
                             "  2  = Accept Option 2 [Current Branch / HEAD] (Bottom)\n"
-                            "  1A = Accept Option 1 for all remaining conflicts\n"
-                            "  2A = Accept Option 2 for all remaining conflicts\n"
+                            f"  1A = Accept Option 1 for all remaining {cat_type.upper()} conflicts\n"
+                            f"  2A = Accept Option 2 for all remaining {cat_type.upper()} conflicts\n"
                             "  s  = Skip: "
                         )
                     elif is_divergent:
@@ -1116,14 +1148,14 @@ def run_mode_1_conflict_markers(
                             f"Select option for DIFFERENT-CONTENT Bookmark conflict:\n"
                             "  1  = Accept Option 1 [Incoming Change Bookmark]\n"
                             "  2  = Accept Option 2 [Current Branch / HEAD Bookmark]\n"
-                            "  1A = Accept Option 1 for all remaining conflicts\n"
-                            "  2A = Accept Option 2 for all remaining conflicts\n"
+                            "  1A = Accept Option 1 for all remaining BOOKMARK conflicts\n"
+                            "  2A = Accept Option 2 for all remaining BOOKMARK conflicts\n"
                             "  s  = Skip (Do NOT touch, leave conflict untouched): "
                         )
                     elif is_pure:
                         prompt_msg = (
-                            f"Select option to KEEP for this {conflict_target_type.upper()} conflict marker:\n"
-                            "  (1 = Keep Option 1 [Incoming], 2 = Keep Option 2 [Current], 1A = Keep Option 1 for ALL, 2A = Keep Option 2 for ALL, s = skip): "
+                            f"Select option to KEEP for this {cat_type.upper()} conflict marker:\n"
+                            f"  (1 = Option 1 [Incoming], 2 = Option 2 [Current], 1A = Option 1 for ALL {cat_type.upper()}S, 2A = Option 2 for ALL {cat_type.upper()}S, s = skip): "
                         )
                     else:
                         prompt_msg = (
@@ -1132,8 +1164,8 @@ def run_mode_1_conflict_markers(
                             "  2  = Full Option 2 [Current Branch]\n"
                             "  1P = Partial Fix: Update tag to Option 1 [Incoming], KEEP conflict markers for visual/other changes\n"
                             "  2P = Partial Fix: Update tag to Option 2 [Current], KEEP conflict markers for visual/other changes\n"
-                            "  1A = Full Option 1 for ALL remaining conflicts\n"
-                            "  2A = Full Option 2 for ALL remaining conflicts\n"
+                            f"  1A = Full Option 1 for ALL remaining {cat_type.upper()} conflicts\n"
+                            f"  2A = Full Option 2 for ALL remaining {cat_type.upper()} conflicts\n"
                             "  s  = Skip: "
                         )
 
@@ -1157,13 +1189,13 @@ def run_mode_1_conflict_markers(
                         break
                     elif choice in ("1a", "a1", "all1"):
                         selected_option = "1"
-                        auto_keep_state[0] = "first"
-                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 1 [Incoming Change] for remaining {conflict_target_type.upper()} conflicts.{CLR_RESET}")
+                        category_auto_keep[cat_type] = "first"
+                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL for category [{cat_type.upper()}]: Keeping Option 1 [Incoming Change].{CLR_RESET}")
                         break
                     elif choice in ("2a", "a2", "all2"):
                         selected_option = "2"
-                        auto_keep_state[0] = "last"
-                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 2 [Current Branch] for remaining {conflict_target_type.upper()} conflicts.{CLR_RESET}")
+                        category_auto_keep[cat_type] = "last"
+                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL for category [{cat_type.upper()}]: Keeping Option 2 [Current Branch].{CLR_RESET}")
                         break
                     print("Invalid choice. Please enter a valid option.")
 
@@ -1189,7 +1221,7 @@ def run_mode_1_conflict_markers(
                         lines_to_delete.add(idx)
 
                 # Extract and propagate hash replacement ONLY if propagate_refs is True
-                if propagate_refs and (conflict_target_type == "bookmark" or (conflict_target_type == "all" and is_pure)):
+                if propagate_refs and (cat_type == "bookmark" or (conflict_target_type == "all" and is_pure)):
                     kept_hash = None
                     discarded_hash = None
 
@@ -1215,11 +1247,11 @@ def run_mode_1_conflict_markers(
                 source_lines = conflict.incoming_lines if selected_option == "1P" else conflict.head_lines
 
                 extracted_tag_line = None
-                if conflict_target_type == "lineage":
+                if cat_type == "lineage":
                     pat = TAG_PATTERN
-                elif conflict_target_type == "logical_id":
+                elif cat_type == "logical_id":
                     pat = LOGICAL_ID_PATTERN
-                elif conflict_target_type == "bookmark":
+                elif cat_type == "bookmark":
                     pat = BOOKMARK_ID_PATTERN
                 else:
                     pat = SCHEMA_PATTERN
