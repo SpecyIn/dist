@@ -26,8 +26,9 @@ Modes & Capabilities:
      - Performance-Optimized Optional Cross-Reference Propagation: Scans project files to update cross-references of replaced bookmark/object IDs.
      - Bulletproof Index-Based Deletion: Immune to line ending (\r\n vs \n) or whitespace differences.
 
-2. Mode 2: Duplicate Object & JSON Comma Formatting Resolver.
+2. Mode 2: Duplicate Object, Field Parameter & JSON Comma Formatting Resolver.
    - Target Objects: 1 - Columns, 2 - Expressions, 3 - Relationships (reverse pair canonical matching), 4 - JSON Comma & Syntax Auto-Formatter, 5 - All, b - Back to Main Menu.
+   - Auto-Fixes Field Parameter metadata: Auto-updates 'length' properties to match actual projection item counts and re-sequences 'index' values (0, 1, 2, 3...) in JSON & TMDL files.
    - Auto-Fixes missing commas between adjacent JSON objects (}\n{ -> },\n{), removes duplicate commas, and strips invalid trailing commas before brackets.
    - Accurately tracks files_scanned and files_modified statistics.
 
@@ -38,13 +39,14 @@ Modes & Capabilities:
    - Batches clean files into `git add` calls of 50 files per process.
 
 4. Mode 4: Power BI PBIP Metadata Health & Diagnostic Check.
-   - Complete health validation scanning for remaining Git conflict markers, duplicate TMDL objects, JSON syntax errors, and missing lineageTags with exact line numbers.
+   - Complete health validation scanning for remaining Git conflict markers, duplicate TMDL objects, Field Parameter length/index mismatches, JSON syntax errors, and missing lineageTags with exact line numbers.
 
 5. Mode 5: Detailed Conflict Review & Visual Diff Viewer.
    - Reviews remaining Git conflicts one-by-one with full line-by-line diff highlights (* <-- DIFFERENT).
    - Option [1] is ALWAYS Incoming Change (Top), Option [2] is ALWAYS Current Branch / HEAD (Bottom).
 
 Features & Controls:
+- Field Parameter Validation & Auto-Fix: Validates and fixes Field Parameter projection lengths and index sequences (0, 1, 2, 3...) across TMDL & JSON report files.
 - Sub-Menu Back Navigation: Enter 'b' or '0' at any sub-menu prompt to immediately return to the Main Menu.
 - Category-Scoped 1A/2A (Mode 1 Combo): Auto-resolve (1A/2A) applies strictly per property category (Lineage, LogicalId, Bookmark, Subset Addition, Empty-Side Addition), preventing accidental global overwrites.
 - Ultra-Fast Staging (Mode 3): Single-pass Git status query skips unmodified & already-staged files in 10ms.
@@ -65,7 +67,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Enable ANSI escape sequences on Windows console
 if sys.platform == "win32":
@@ -124,7 +126,7 @@ class FileTask:
 @dataclass
 class DiagnosticIssue:
     file_path: Path
-    issue_type: str  # "Git Conflict Marker", "Duplicate Object", "JSON Syntax Error", "Missing LineageTag"
+    issue_type: str  # "Git Conflict Marker", "Duplicate Object", "JSON Syntax Error", "Missing LineageTag", "Field Parameter Length Mismatch", "Field Parameter Index Error"
     description: str
     line_no: Optional[int] = None
 
@@ -176,6 +178,15 @@ BOOKMARK_ID_PATTERN = re.compile(
 FROM_COL_PATTERN = re.compile(r'^\s*["\']?fromColumn["\']?\s*:\s*(.+)$', re.IGNORECASE)
 TO_COL_PATTERN = re.compile(r'^\s*["\']?toColumn["\']?\s*:\s*(.+)$', re.IGNORECASE)
 
+TMDL_FP_TUPLE_PATTERN = re.compile(
+    r'^(\s*\(\s*"[^"]+"\s*,\s*NAMEOF\([^)]+\)\s*,\s*)(\d+)(\s*\)\s*,?\s*)$',
+    re.IGNORECASE
+)
+
+DUPLICATE_COMMAS_PATTERN = re.compile(r',\s*,')
+TRAILING_COMMAS_PATTERN = re.compile(r',\s*([\}\]])')
+JSON_VAL_END_PATTERN = re.compile(r'(:\s*(?:true|false|null|\d+|"[^"]*"))$')
+
 
 def get_indent_level(indent_str: str) -> int:
     """Calculates indentation level converting tabs to 4 spaces."""
@@ -213,7 +224,7 @@ def fix_pbip_json_formatting(content: str) -> str:
         return content
 
     # Fix duplicate commas
-    content = re.sub(r',\s*,', ',', content)
+    content = DUPLICATE_COMMAS_PATTERN.sub(',', content)
 
     # Fix missing commas between closing brace/quote/digit/boolean/null and opening brace/quote/bracket on next line
     lines = content.splitlines(keepends=True)
@@ -241,7 +252,7 @@ def fix_pbip_json_formatting(content: str) -> str:
                     curr_strip.endswith("}") or
                     curr_strip.endswith("]") or
                     curr_strip.endswith('"') or
-                    re.search(r'(:\s*(?:true|false|null|\d+|\"[^\"]*\"))$', curr_strip)
+                    bool(JSON_VAL_END_PATTERN.search(curr_strip))
                 )
                 starts_with_new_item = (
                     next_strip.startswith("{") or
@@ -255,9 +266,119 @@ def fix_pbip_json_formatting(content: str) -> str:
 
     new_content = "".join(fixed_lines)
     # Remove trailing commas before closing } or ]
-    new_content = re.sub(r',\s*([\}\]])', r'\n\1', new_content)
+    new_content = TRAILING_COMMAS_PATTERN.sub(r'\n\1', new_content)
 
     return new_content
+
+
+def fix_field_parameter_metadata(content: str) -> Tuple[str, int]:
+    """
+    Validates and auto-fixes Field Parameter metadata in JSON and TMDL files:
+    1. In JSON Report/Visual files:
+       - Checks objects containing 'projections' arrays (or 'parameter' with 'projections' & 'length').
+       - Auto-updates 'length' to match len(projections).
+       - Auto-sequences projection 'index' properties (0, 1, 2, 3... N-1).
+    2. In TMDL Field Parameter DAX source blocks:
+       - Auto-sequences tuple 0-based indices in source = { ("Label", NAMEOF(...), 0), ... }.
+
+    Returns (updated_content, total_fixes_made).
+    """
+    if not content.strip():
+        return content, 0
+
+    total_fixes = 0
+
+    # 1. Check for JSON Field Parameter Structure
+    try:
+        data = json.loads(content)
+
+        def walk_and_fix(node: Any) -> int:
+            nonlocal total_fixes
+            fixes_in_node = 0
+
+            if isinstance(node, dict):
+                # Check for parameter container object
+                for key, val in list(node.items()):
+                    if isinstance(val, dict):
+                        projs = val.get("projections") or val.get("parameterProjections") or val.get("parameterFields")
+                        if isinstance(projs, list) and projs:
+                            expected_len = len(projs)
+                            if "length" in val and val["length"] != expected_len:
+                                val["length"] = expected_len
+                                fixes_in_node += 1
+
+                            for idx, item in enumerate(projs):
+                                if isinstance(item, dict) and "index" in item:
+                                    if item["index"] != idx:
+                                        item["index"] = idx
+                                        fixes_in_node += 1
+
+                    elif key in ("projections", "parameterProjections", "parameterFields") and isinstance(val, list) and val:
+                        expected_len = len(val)
+                        if "length" in node and node["length"] != expected_len:
+                            node["length"] = expected_len
+                            fixes_in_node += 1
+
+                        for idx, item in enumerate(val):
+                            if isinstance(item, dict) and "index" in item:
+                                if item["index"] != idx:
+                                    item["index"] = idx
+                                    fixes_in_node += 1
+
+                for child in node.values():
+                    fixes_in_node += walk_and_fix(child)
+
+            elif isinstance(node, list):
+                for child in node:
+                    fixes_in_node += walk_and_fix(child)
+
+            return fixes_in_node
+
+        j_fixes = walk_and_fix(data)
+        if j_fixes > 0:
+            total_fixes += j_fixes
+            content = json.dumps(data, indent=2)
+    except Exception:
+        pass
+
+    # 2. Check for TMDL Field Parameter DAX Source Tuples
+    lines = content.splitlines(keepends=True)
+    new_tmdl_lines: List[str] = []
+    in_tmdl_fp_source = False
+    current_tuple_index = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if "source =" in stripped and ("{" in stripped or "=" in stripped):
+            in_tmdl_fp_source = True
+            current_tuple_index = 0
+            new_tmdl_lines.append(line)
+            continue
+        elif stripped.startswith("}") and in_tmdl_fp_source:
+            in_tmdl_fp_source = False
+            new_tmdl_lines.append(line)
+            continue
+
+        match = TMDL_FP_TUPLE_PATTERN.match(line)
+        if match and in_tmdl_fp_source:
+            prefix = match.group(1)
+            found_idx = int(match.group(2))
+            suffix = match.group(3)
+
+            if found_idx != current_tuple_index:
+                total_fixes += 1
+                new_line = f"{prefix}{current_tuple_index}{suffix}"
+                new_tmdl_lines.append(new_line)
+            else:
+                new_tmdl_lines.append(line)
+            current_tuple_index += 1
+        else:
+            new_tmdl_lines.append(line)
+
+    if total_fixes > 0:
+        content = "".join(new_tmdl_lines)
+
+    return content, total_fixes
 
 
 def extract_column_name(header_str: str) -> str:
@@ -825,9 +946,10 @@ def parse_git_conflict_blocks(
 
     while i < n:
         line = lines[i]
-        if line.strip().startswith("<<<<<<<"):
+        stripped = line.strip()
+        if stripped.startswith("<<<<<<<"):
             start_idx = i
-            ref_head = line.strip()[7:].strip()
+            ref_head = stripped[7:].strip()
             head_label = f"Current Branch ({ref_head if ref_head else 'HEAD'})"
             sep_idx = None
             end_idx = None
@@ -1068,8 +1190,8 @@ def get_target_object_type(args_type: Optional[str]) -> str:
     print(" 1 - Columns")
     print(" 2 - Expressions")
     print(" 3 - Relationships")
-    print(" 4 - JSON Comma & Syntax Auto-Formatter (Fix missing/duplicate commas resulting from additions)")
-    print(" 5 - All (Columns, Expressions, Relationships & Comma Formatting Auto-Fixer)")
+    print(" 4 - Field Parameter & JSON Comma Syntax Auto-Formatter (Auto-fix length, indices & commas)")
+    print(" 5 - All (Columns, Expressions, Relationships & Field Parameter / JSON Auto-Fixer)")
     print(" b - Back to Main Menu")
     while True:
         choice = input("Enter option (1, 2, 3, 4, 5, or b): ").strip().lower()
@@ -1096,6 +1218,7 @@ def run_mode_1_conflict_markers(
     In Combo Mode (conflict_target_type == "all"), 1A / 2A auto-keep is SCOPED STRICTLY per category
     (Lineage, LogicalId, Schema, Bookmark, Subset Addition, Empty-Side Addition, Other).
     Distinguishes Subset Additions (base content identical + extra lines) from Empty-Side Additions (content vs blank/empty).
+    Auto-fixes JSON syntax, commas, and Field Parameter metadata after file modification.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
@@ -1337,7 +1460,8 @@ def run_mode_1_conflict_markers(
             cleaned_lines = cleanup_excessive_blank_lines(new_lines)
             new_content = "".join(cleaned_lines)
 
-            # Automatically fix JSON comma syntax formatting if JSON/report file
+            # Auto-format JSON syntax/commas & Field Parameter metadata
+            new_content, fp_count = fix_field_parameter_metadata(new_content)
             if file_path.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
                 new_content = fix_pbip_json_formatting(new_content)
 
@@ -1346,31 +1470,35 @@ def run_mode_1_conflict_markers(
                 encoded = b"\xef\xbb\xbf" + encoded
             with open(file_path, "wb") as f:
                 f.write(encoded)
-            print(f"[UPDATED] File conflict markers resolved & JSON formatted: {file_path}")
+            print(f"[UPDATED] File conflict markers resolved & formatted: {file_path}")
 
 
 def run_mode_2_dedupe_objects(
     target_files: List[Path], target_object_type: str, dry_run: bool, auto_keep_state: List[Optional[str]], stats: SummaryStats
 ) -> None:
     """
-    Mode 2: Deduplicates Objects (Columns, Expressions, Relationships) and auto-fixes JSON comma syntax formatting.
+    Mode 2: Deduplicates Objects (Columns, Expressions, Relationships) and auto-fixes Field Parameter & JSON comma metadata.
     Accurately tracks files_scanned and files_modified statistics.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
-    print(CLR_BOLD + f"  MODE 2: Resolving Duplicate Objects & JSON Formatter (Target: {target_object_type.upper()})" + CLR_RESET)
+    print(CLR_BOLD + f"  MODE 2: Resolving Duplicate Objects & Formatter (Target: {target_object_type.upper()})" + CLR_RESET)
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
 
     if target_object_type in ("formatter", "all"):
         json_files_fixed = 0
         for fpath in target_files:
-            if fpath.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
+            if fpath.suffix.lower() in (".json", ".pbir", ".pbip", ".platform", ".tmdl"):
                 stats.files_scanned += 1
                 try:
                     with open(fpath, "rb") as f:
                         raw = f.read()
                     has_bom = raw.startswith(b"\xef\xbb\xbf")
                     txt = (raw[3:] if has_bom else raw).decode("utf-8")
-                    fixed = fix_pbip_json_formatting(txt)
+                    
+                    fixed, fp_count = fix_field_parameter_metadata(txt)
+                    if fpath.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
+                        fixed = fix_pbip_json_formatting(fixed)
+
                     if fixed != txt:
                         stats.files_modified += 1
                         if not dry_run:
@@ -1380,13 +1508,13 @@ def run_mode_2_dedupe_objects(
                             with open(fpath, "wb") as f:
                                 f.write(enc)
                             json_files_fixed += 1
-                            print(f"  {CLR_GREEN}[FORMATTED]{CLR_RESET} Fixed JSON comma/syntax formatting in: {fpath}")
+                            print(f"  {CLR_GREEN}[FORMATTED]{CLR_RESET} Fixed Field Parameter & JSON metadata in: {fpath}")
                         else:
-                            print(f"  [DRY-RUN FORMAT] Would fix JSON formatting in: {fpath}")
+                            print(f"  [DRY-RUN FORMAT] Would fix Field Parameter / JSON formatting in: {fpath}")
                 except Exception:
                     stats.files_skipped += 1
 
-        print(f"\nJSON Formatter Summary: Scanned {CLR_CYAN}{stats.files_scanned}{CLR_RESET} JSON file(s) | Formatted: {CLR_GREEN}{json_files_fixed}{CLR_RESET} file(s)")
+        print(f"\nFormatter Summary: Scanned {CLR_CYAN}{stats.files_scanned}{CLR_RESET} file(s) | Formatted: {CLR_GREEN}{json_files_fixed}{CLR_RESET} file(s)")
 
     if target_object_type != "formatter":
         tasks, total_duplicates_all = scan_and_prepare_tasks(target_files, target_object_type, stats)
@@ -1519,7 +1647,7 @@ def run_mode_3_stage_clean_files(target_files: List[Path], dry_run: bool, target
 def run_mode_4_metadata_diagnostic(target_files: List[Path]) -> List[DiagnosticIssue]:
     """
     Mode 4: Performs a comprehensive Power BI PBIP Metadata & Health Validation Check.
-    Scans files for remaining conflict markers, duplicate objects, JSON syntax errors, and missing lineageTags.
+    Scans files for remaining conflict markers, duplicate objects, Field Parameter length/index mismatches, JSON syntax errors, and missing lineageTags.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + "  MODE 4: Power BI PBIP Metadata & Health Validation Diagnostic Check" + CLR_RESET)
@@ -1571,10 +1699,51 @@ def run_mode_4_metadata_diagnostic(target_files: List[Path]) -> List[DiagnosticI
                 line_no=dups[0].start_line + 1
             ))
 
-        # 3. Check for JSON Syntax Errors in report/definition files
-        if file_path.suffix.lower() in (".json", ".pbir", ".pbip"):
+        # 3. Check for Field Parameter Length & Index Mismatches
+        if file_path.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
             try:
-                json.loads(content)
+                data = json.loads(content)
+                def check_fp_json(node: Any):
+                    if isinstance(node, dict):
+                        for k, v in list(node.items()):
+                            if isinstance(v, dict):
+                                projs = v.get("projections") or v.get("parameterProjections") or v.get("parameterFields")
+                                if isinstance(projs, list) and projs:
+                                    if "length" in v and v["length"] != len(projs):
+                                        issues.append(DiagnosticIssue(
+                                            file_path=file_path,
+                                            issue_type="Field Parameter Length Mismatch",
+                                            description=f"Field Parameter length property is {v['length']}, but actual projections count is {len(projs)}"
+                                        ))
+                                    indices = [item.get("index") for item in projs if isinstance(item, dict) and "index" in item]
+                                    expected = list(range(len(indices)))
+                                    if indices != expected:
+                                        issues.append(DiagnosticIssue(
+                                            file_path=file_path,
+                                            issue_type="Field Parameter Index Error",
+                                            description=f"Field Parameter index sequence is {indices}, expected {expected}"
+                                        ))
+                            elif k in ("projections", "parameterProjections", "parameterFields") and isinstance(v, list) and v:
+                                if "length" in node and node["length"] != len(v):
+                                    issues.append(DiagnosticIssue(
+                                        file_path=file_path,
+                                        issue_type="Field Parameter Length Mismatch",
+                                        description=f"Field Parameter length property is {node['length']}, but actual projections count is {len(v)}"
+                                    ))
+                                indices = [item.get("index") for item in v if isinstance(item, dict) and "index" in item]
+                                expected = list(range(len(indices)))
+                                if indices != expected:
+                                    issues.append(DiagnosticIssue(
+                                        file_path=file_path,
+                                        issue_type="Field Parameter Index Error",
+                                        description=f"Field Parameter index sequence is {indices}, expected {expected}"
+                                    ))
+                        for child in node.values():
+                            check_fp_json(child)
+                    elif isinstance(node, list):
+                        for child in node:
+                            check_fp_json(child)
+                check_fp_json(data)
             except json.JSONDecodeError as e:
                 issues.append(DiagnosticIssue(
                     file_path=file_path,
@@ -1582,6 +1751,32 @@ def run_mode_4_metadata_diagnostic(target_files: List[Path]) -> List[DiagnosticI
                     description=f"JSON parse error: {e.msg} at line {e.lineno}, col {e.colno}",
                     line_no=e.lineno
                 ))
+
+        # Check for TMDL Field Parameter Tuple Index Mismatches
+        if file_path.suffix.lower() == ".tmdl":
+            in_fp_source = False
+            cur_tuple_idx = 0
+            for l_idx, line in enumerate(lines, 1):
+                s = line.strip()
+                if "source =" in s and ("{" in s or "=" in s):
+                    in_fp_source = True
+                    cur_tuple_idx = 0
+                    continue
+                elif s.startswith("}") and in_fp_source:
+                    in_fp_source = False
+                    continue
+
+                m = TMDL_FP_TUPLE_PATTERN.match(line)
+                if m and in_fp_source:
+                    idx_val = int(m.group(2))
+                    if idx_val != cur_tuple_idx:
+                        issues.append(DiagnosticIssue(
+                            file_path=file_path,
+                            issue_type="Field Parameter Index Error",
+                            description=f"TMDL Field Parameter tuple has index {idx_val}, expected sequential index {cur_tuple_idx}",
+                            line_no=l_idx
+                        ))
+                    cur_tuple_idx += 1
 
         # 4. Check for missing LineageTags in TMDL column blocks
         if file_path.suffix.lower() == ".tmdl":
@@ -1754,7 +1949,8 @@ def run_mode_5_detailed_conflict_review(
             cleaned_lines = cleanup_excessive_blank_lines(new_lines)
             new_content = "".join(cleaned_lines)
 
-            # Auto-format JSON syntax/commas if JSON/report file
+            # Auto-format JSON syntax/commas & Field Parameter metadata
+            new_content, fp_count = fix_field_parameter_metadata(new_content)
             if file_path.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
                 new_content = fix_pbip_json_formatting(new_content)
 
@@ -1763,7 +1959,7 @@ def run_mode_5_detailed_conflict_review(
                 encoded = b"\xef\xbb\xbf" + encoded
             with open(file_path, "wb") as f:
                 f.write(encoded)
-            print(f"[UPDATED] File conflict markers resolved & JSON formatted: {file_path}")
+            print(f"[UPDATED] File conflict markers resolved & formatted: {file_path}")
 
 
 def scan_and_prepare_tasks(
@@ -1958,7 +2154,8 @@ def process_file_task(
         cleaned_lines = cleanup_excessive_blank_lines(new_lines)
         new_content = "".join(cleaned_lines)
 
-        # Auto-format JSON syntax/commas if JSON/report file
+        # Auto-format JSON syntax/commas & Field Parameter metadata
+        new_content, fp_count = fix_field_parameter_metadata(new_content)
         if task.file_path.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
             new_content = fix_pbip_json_formatting(new_content)
 
@@ -1993,7 +2190,7 @@ def get_action_mode(args_mode: Optional[str]) -> str:
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
     print("Select resolution action to perform:")
     print(" 1 - Resolve Git Conflict Markers (lineageTag, logicalId, $schema, bookmark IDs, additions, and all conflicts)")
-    print(" 2 - Resolve Duplicate Objects & Auto-Format JSON Commas/Syntax")
+    print(" 2 - Resolve Duplicate Objects & Auto-Format Field Parameter / JSON Metadata")
     print(" 3 - Stage Clean Files to Git (Automatically git add files with 0 remaining conflict markers)")
     print(" 4 - Power BI PBIP Metadata Health & Diagnostic Check (Scan for all remaining issues)")
     print(" 5 - Detailed Conflict Review & Visual Diff Viewer (Review remaining conflicts one-by-one with diff highlights)")
