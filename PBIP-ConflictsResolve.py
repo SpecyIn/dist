@@ -13,9 +13,10 @@ Modes & Capabilities:
      2 - LogicalIds (logicalId, sourceLogicalId in TMDL, JSON, & .platform files)
      3 - SchemaTags ($schema: "https://..." in PBIP JSON report files)
      4 - Bookmark / Object Name IDs ("name": "<hex-hash>" in bookmarks.json, page.json, visual.json)
-     5 - Additions Only (Accepts additions when one side contains all lines of the other side OR when one side is empty)
+     5 - Additions Only (Interactive approval for additions with 1, 2, 1A, 2A, s options & recommended badges)
      6 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)
    - Features:
+     - Interactive Approval for Additions: Additions display pure addition notices with recommended options (1/2), allowing manual review or bulk category auto-keep (1A/2A).
      - Category-Scoped Auto-Keep in Combo Mode: In Combo Mode (Option 6), typing 1A or 2A auto-keeps remaining conflicts strictly within THAT conflict category (LineageTags, LogicalIds, SchemaTags, Bookmarks, Additions, etc.) and prompts again when transitioning to a new category.
      - Empty-Side & Subset Addition Detection: Auto-identifies pure additions even when one branch is completely empty.
      - Pure vs Mixed Conflict Detection: Detects single-line property vs mixed visual/expression changes.
@@ -975,7 +976,7 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
     print(" 2 - LogicalIds (logicalId, sourceLogicalId)")
     print(" 3 - SchemaTags ($schema: \"https://...\")")
     print(" 4 - Bookmark / Object Name IDs (\"name\": \"<hex-hash>\")")
-    print(" 5 - Additions Only (Accept additions when one side contains all lines of the other side OR when one side is empty)")
+    print(" 5 - Additions Only (Interactive approval for additions with 1, 2, 1A, 2A, s options & recommended badges)")
     print(" 6 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)")
     while True:
         choice = input("Enter option (1, 2, 3, 4, 5, or 6): ").strip()
@@ -1039,6 +1040,7 @@ def run_mode_1_conflict_markers(
     Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) filtered by conflict_target_type.
     In Combo Mode (conflict_target_type == "all"), 1A / 2A auto-keep is SCOPED STRICTLY per category
     (Lineage, LogicalId, Schema, Bookmark, Addition, Other) so typing 1A on LineageTags does NOT auto-accept Bookmarks!
+    Additions prompt interactively with 1, 2, 1A, 2A, s and show recommendation badges.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
@@ -1124,12 +1126,6 @@ def run_mode_1_conflict_markers(
             elif current_cat_keep == "last" and not is_divergent:
                 selected_option = "2"
                 print(f"  [AUTO-KEEP 2A ({cat_type.upper()})] Selected Option 2 (Current Branch)")
-            elif inc_has_additions and (conflict_target_type == "addition" or cat_type == "addition"):
-                selected_option = "1"
-                print("  [AUTO-ACCEPT ADDITION] Selected Option 1 (Incoming Change - Contains all base lines + additions)")
-            elif head_has_additions and (conflict_target_type == "addition" or cat_type == "addition"):
-                selected_option = "2"
-                print("  [AUTO-ACCEPT ADDITION] Selected Option 2 (Current Branch - Contains all base lines + additions)")
             else:
                 while True:
                     if inc_has_additions or head_has_additions:
