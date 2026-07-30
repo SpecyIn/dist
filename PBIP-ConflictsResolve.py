@@ -13,12 +13,12 @@ Modes & Capabilities:
      2 - LogicalIds (logicalId, sourceLogicalId in TMDL, JSON, & .platform files)
      3 - SchemaTags ($schema: "https://..." in PBIP JSON report files)
      4 - Bookmark / Object Name IDs ("name": "<hex-hash>" in bookmarks.json, page.json, visual.json)
-     5 - Additions Only (Interactive approval for additions with 1, 2, 1A, 2A, s options & recommended badges)
+     5 - Additions Only (Detailed sub-filters: Subset Additions [base same + extra], Empty-Side Additions [content vs blank], or All Additions)
      6 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)
    - Features:
-     - Interactive Approval for Additions: Additions display pure addition notices with recommended options (1/2), allowing manual review or bulk category auto-keep (1A/2A).
+     - Addition Sub-Types (Subset vs Empty-Side): Distinguishes Subset Additions (base content identical + extra lines) from Empty-Side Additions (one branch contains text, other branch is completely empty/blank).
+     - Interactive Approval for Additions: Displays addition notices with recommended options (1/2), allowing manual review or bulk category auto-keep (1A/2A).
      - Category-Scoped Auto-Keep in Combo Mode: In Combo Mode (Option 6), typing 1A or 2A auto-keeps remaining conflicts strictly within THAT conflict category (LineageTags, LogicalIds, SchemaTags, Bookmarks, Additions, etc.) and prompts again when transitioning to a new category.
-     - Empty-Side & Subset Addition Detection: Auto-identifies pure additions even when one branch is completely empty.
      - Pure vs Mixed Conflict Detection: Detects single-line property vs mixed visual/expression changes.
      - Partial Fix Options (1P / 2P): Resolves property lines while keeping conflict markers around visual changes.
      - Bookmark Content Divergence Protection: Detects if bookmark content differs alongside ID, pausing 1A/2A auto-keep to prompt for safe manual choice.
@@ -44,7 +44,7 @@ Modes & Capabilities:
    - Option [1] is ALWAYS Incoming Change (Top), Option [2] is ALWAYS Current Branch / HEAD (Bottom).
 
 Features & Controls:
-- Category-Scoped 1A/2A (Mode 1 Combo): Auto-resolve (1A/2A) applies strictly per property category (Lineage, LogicalId, Bookmark, Addition), preventing accidental global overwrites across different categories.
+- Category-Scoped 1A/2A (Mode 1 Combo): Auto-resolve (1A/2A) applies strictly per property category (Lineage, LogicalId, Bookmark, Subset Addition, Empty-Side Addition), preventing accidental global overwrites.
 - Ultra-Fast Staging (Mode 3): Single-pass Git status query skips unmodified & already-staged files in 10ms.
 - Live Real-Time Progress: Clear terminal progress feedback ([1/N] Checking...) eliminates perceived hangs.
 - Interactive Navigation Loop: Sub-menu prompt to return to the Main Menu after completing tasks.
@@ -289,30 +289,50 @@ def get_canonical_relationship_key(from_col: str, to_col: str) -> Tuple[str, str
     return tuple(sorted([norm_from, norm_to]))
 
 
-def is_subset_addition(lines_a: List[str], lines_b: List[str]) -> bool:
+def is_subset_addition_only(lines_a: List[str], lines_b: List[str]) -> bool:
     """
-    Checks if lines_a is a subset of lines_b (ignoring whitespace and trailing commas).
-    Returns True if lines_b contains all lines of lines_a PLUS extra addition line(s)
-    OR if lines_a is completely empty and lines_b contains content.
+    Checks if lines_a and lines_b are BOTH non-empty and one is a strict subset of the other (extra lines added).
+    Sub-Type 1: Subset Addition (Base content identical + extra lines added).
     """
     clean_a = [l.strip().rstrip(",") for l in lines_a if l.strip()]
     clean_b = [l.strip().rstrip(",") for l in lines_b if l.strip()]
-
-    # If side A is completely empty and side B has lines, B is a pure addition over empty A!
-    if not clean_a and clean_b:
-        return True
 
     if not clean_a or not clean_b:
         return False
 
     it = iter(clean_b)
-    return all(item in it for item in clean_a) and len(clean_b) > len(clean_a)
+    if all(item in it for item in clean_a) and len(clean_b) > len(clean_a):
+        return True
+
+    it_rev = iter(clean_a)
+    if all(item in it_rev for item in clean_b) and len(clean_a) > len(clean_b):
+        return True
+
+    return False
+
+
+def is_empty_side_addition_only(lines_a: List[str], lines_b: List[str]) -> bool:
+    """
+    Checks if one side contains content lines while the other side is completely empty/blank.
+    Sub-Type 2: Empty-Side Addition (Content vs Blank/Empty).
+    """
+    clean_a = [l.strip().rstrip(",") for l in lines_a if l.strip()]
+    clean_b = [l.strip().rstrip(",") for l in lines_b if l.strip()]
+
+    return (not clean_a and bool(clean_b)) or (bool(clean_a) and not clean_b)
+
+
+def is_subset_addition(lines_a: List[str], lines_b: List[str]) -> bool:
+    """
+    Returns True if conflict is EITHER a Subset Addition (Sub-Type 1) OR an Empty-Side Addition (Sub-Type 2).
+    """
+    return is_subset_addition_only(lines_a, lines_b) or is_empty_side_addition_only(lines_a, lines_b)
 
 
 def detect_conflict_category(conflict: ConflictMarkerBlock) -> str:
     """
     Classifies a conflict block into a category:
-    'lineage', 'logical_id', 'schema', 'bookmark', 'addition', or 'other'.
+    'lineage', 'logical_id', 'schema', 'bookmark', 'subset_addition', 'empty_addition', or 'other'.
     """
     all_block_lines = conflict.head_lines + conflict.incoming_lines
 
@@ -324,8 +344,10 @@ def detect_conflict_category(conflict: ConflictMarkerBlock) -> str:
         return "schema"
     if any(BOOKMARK_ID_PATTERN.match(l) for l in all_block_lines):
         return "bookmark"
-    if is_subset_addition(conflict.head_lines, conflict.incoming_lines) or is_subset_addition(conflict.incoming_lines, conflict.head_lines):
-        return "addition"
+    if is_subset_addition_only(conflict.head_lines, conflict.incoming_lines):
+        return "subset_addition"
+    if is_empty_side_addition_only(conflict.head_lines, conflict.incoming_lines):
+        return "empty_addition"
 
     return "other"
 
@@ -346,8 +368,12 @@ def is_pure_property_conflict(conflict: ConflictMarkerBlock, tag_filter: str) ->
         return all(SCHEMA_PATTERN.match(l) for l in all_lines)
     elif tag_filter == "bookmark":
         return all(BOOKMARK_ID_PATTERN.match(l) for l in all_lines)
+    elif tag_filter == "subset_addition":
+        return is_subset_addition_only(conflict.head_lines, conflict.incoming_lines)
+    elif tag_filter == "empty_addition":
+        return is_empty_side_addition_only(conflict.head_lines, conflict.incoming_lines)
     elif tag_filter == "addition":
-        return is_subset_addition(conflict.head_lines, conflict.incoming_lines) or is_subset_addition(conflict.incoming_lines, conflict.head_lines)
+        return is_subset_addition(conflict.head_lines, conflict.incoming_lines)
 
     return True
 
@@ -786,7 +812,9 @@ def parse_git_conflict_blocks(
     - 'logical_id': blocks containing logicalId or sourceLogicalId
     - 'schema': blocks containing $schema
     - 'bookmark': blocks containing "name": "<hex-hash>"
-    - 'addition': blocks where one side contains all lines of the other side OR where one side is empty
+    - 'subset_addition': blocks where base content is identical + extra lines added
+    - 'empty_addition': blocks where one side is completely empty/blank and other side has text
+    - 'addition': any addition block (both subset and empty-side additions)
     - 'all': any conflict block (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)
     """
     conflict_blocks: List[ConflictMarkerBlock] = []
@@ -830,8 +858,12 @@ def parse_git_conflict_blocks(
                     should_include = any(SCHEMA_PATTERN.match(l) for l in all_block_lines)
                 elif tag_filter == "bookmark":
                     should_include = any(BOOKMARK_ID_PATTERN.match(l) for l in all_block_lines)
+                elif tag_filter == "subset_addition":
+                    should_include = is_subset_addition_only(head_lines, inc_lines)
+                elif tag_filter == "empty_addition":
+                    should_include = is_empty_side_addition_only(head_lines, inc_lines)
                 elif tag_filter == "addition":
-                    should_include = is_subset_addition(head_lines, inc_lines) or is_subset_addition(inc_lines, head_lines)
+                    should_include = is_subset_addition(head_lines, inc_lines)
                 elif tag_filter == "all":
                     should_include = True
 
@@ -953,7 +985,7 @@ def ask_propagate_cross_references(args_propagate: Optional[bool] = None) -> boo
 
 def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
     """
-    Returns normalized conflict marker target filter: 'lineage', 'logical_id', 'schema', 'bookmark', 'addition', or 'all'.
+    Returns normalized conflict marker target filter: 'lineage', 'logical_id', 'schema', 'bookmark', 'subset_addition', 'empty_addition', 'addition', or 'all'.
     Prompts interactively if not provided as CLI argument.
     """
     if args_conflict_type:
@@ -966,7 +998,11 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
             return "schema"
         elif val in ("4", "bookmark", "id", "hash"):
             return "bookmark"
-        elif val in ("5", "addition", "additions", "add"):
+        elif val in ("5.1", "subset", "subset_addition"):
+            return "subset_addition"
+        elif val in ("5.2", "empty", "empty_addition"):
+            return "empty_addition"
+        elif val in ("5", "5.3", "addition", "additions", "add"):
             return "addition"
         elif val in ("6", "all", "rest", "both"):
             return "all"
@@ -976,10 +1012,13 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
     print(" 2 - LogicalIds (logicalId, sourceLogicalId)")
     print(" 3 - SchemaTags ($schema: \"https://...\")")
     print(" 4 - Bookmark / Object Name IDs (\"name\": \"<hex-hash>\")")
-    print(" 5 - Additions Only (Interactive approval for additions with 1, 2, 1A, 2A, s options & recommended badges)")
+    print(" 5 - Additions Only:")
+    print("     5.1 - Subset Additions Only (Base content identical + extra lines added)")
+    print("     5.2 - Empty-Side Additions Only (One side contains content, other side is blank/empty)")
+    print("     5.3 - All Additions (Both Subset & Empty-Side Additions)")
     print(" 6 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)")
     while True:
-        choice = input("Enter option (1, 2, 3, 4, 5, or 6): ").strip()
+        choice = input("Enter option (1, 2, 3, 4, 5, 5.1, 5.2, 5.3, or 6): ").strip().lower()
         if choice == "1":
             return "lineage"
         elif choice == "2":
@@ -988,11 +1027,15 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
             return "schema"
         elif choice == "4":
             return "bookmark"
-        elif choice == "5":
+        elif choice in ("5.1", "subset"):
+            return "subset_addition"
+        elif choice in ("5.2", "empty"):
+            return "empty_addition"
+        elif choice in ("5", "5.3", "addition"):
             return "addition"
         elif choice == "6":
             return "all"
-        print("Invalid input. Please enter 1, 2, 3, 4, 5, or 6.\n")
+        print("Invalid input. Please enter 1, 2, 3, 4, 5.1, 5.2, 5.3, or 6.\n")
 
 
 def get_target_object_type(args_type: Optional[str]) -> str:
@@ -1039,8 +1082,8 @@ def run_mode_1_conflict_markers(
     """
     Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) filtered by conflict_target_type.
     In Combo Mode (conflict_target_type == "all"), 1A / 2A auto-keep is SCOPED STRICTLY per category
-    (Lineage, LogicalId, Schema, Bookmark, Addition, Other) so typing 1A on LineageTags does NOT auto-accept Bookmarks!
-    Additions prompt interactively with 1, 2, 1A, 2A, s and show recommendation badges.
+    (Lineage, LogicalId, Schema, Bookmark, Subset Addition, Empty-Side Addition, Other).
+    Distinguishes Subset Additions (base content identical + extra lines) from Empty-Side Additions (content vs blank/empty).
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
@@ -1095,15 +1138,21 @@ def run_mode_1_conflict_markers(
             same_bookmark_content = is_bookmark_content_same(conflict) if (cat_type == "bookmark" or conflict_target_type == "bookmark") else True
             is_divergent = (cat_type == "bookmark" and not same_bookmark_content)
 
-            inc_has_additions = is_subset_addition(conflict.head_lines, conflict.incoming_lines)
-            head_has_additions = is_subset_addition(conflict.incoming_lines, conflict.head_lines)
+            is_subset = is_subset_addition_only(conflict.head_lines, conflict.incoming_lines)
+            is_empty_side = is_empty_side_addition_only(conflict.head_lines, conflict.incoming_lines)
+
+            # Determine which side has the addition content
+            inc_has_content = bool([l for l in conflict.incoming_lines if l.strip()])
+            head_has_content = bool([l for l in conflict.head_lines if l.strip()])
+            rec_side = 1 if inc_has_content else 2
 
             print("\n" + CLR_BOLD + f"Conflict {c_idx} of {num_conflicts} (Category: {cat_type.upper()}, Lines {conflict.start_line + 1}-{conflict.end_line + 1}):" + CLR_RESET)
 
-            if inc_has_additions:
-                print(f"{CLR_GREEN}  [+] PURE ADDITION DETECTED: Option 1 [Incoming Change] contains all base lines PLUS new additions!{CLR_RESET}")
-            elif head_has_additions:
-                print(f"{CLR_GREEN}  [+] PURE ADDITION DETECTED: Option 2 [Current Branch] contains all base lines PLUS new additions!{CLR_RESET}")
+            if is_subset:
+                print(f"{CLR_GREEN}  [+] SUBSET ADDITION DETECTED: Base content identical + extra lines added on Option {rec_side}!{CLR_RESET}")
+            elif is_empty_side:
+                empty_side_str = "Option 2 is BLANK/EMPTY" if inc_has_content else "Option 1 is BLANK/EMPTY"
+                print(f"{CLR_GREEN}  [+] EMPTY-SIDE ADDITION DETECTED: Option {rec_side} contains content while {empty_side_str}!{CLR_RESET}")
             elif is_divergent:
                 print(f"{CLR_RED}  [!] BOOKMARK DIVERGENCE DETECTED: Name is DIFFERENT AND Content/Properties are ALSO DIFFERENT!{CLR_RESET}")
             elif not is_pure:
@@ -1128,10 +1177,11 @@ def run_mode_1_conflict_markers(
                 print(f"  [AUTO-KEEP 2A ({cat_type.upper()})] Selected Option 2 (Current Branch)")
             else:
                 while True:
-                    if inc_has_additions or head_has_additions:
-                        rec_str = " (Recommended: 1)" if inc_has_additions else " (Recommended: 2)"
+                    if is_subset or is_empty_side:
+                        add_kind = "SUBSET ADDITION" if is_subset else "EMPTY-SIDE ADDITION"
+                        rec_str = f" (Recommended: {rec_side})"
                         prompt_msg = (
-                            f"Select option for ADDITION conflict{rec_str}:\n"
+                            f"Select option for {add_kind} conflict{rec_str}:\n"
                             "  1  = Accept Option 1 [Incoming Change] (Top)\n"
                             "  2  = Accept Option 2 [Current Branch / HEAD] (Bottom)\n"
                             f"  1A = Accept Option 1 for all remaining {cat_type.upper()} conflicts\n"
@@ -2022,8 +2072,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--conflict-type",
-        choices=["1", "2", "3", "4", "5", "6", "lineage", "logical", "schema", "bookmark", "addition", "all"],
-        help="Target property filter for Mode 1 conflict markers: 1/lineage, 2/logical, 3/schema, 4/bookmark, 5/addition, 6/all.",
+        choices=["1", "2", "3", "4", "5", "5.1", "5.2", "5.3", "6", "lineage", "logical", "schema", "bookmark", "subset", "empty", "addition", "all"],
+        help="Target property filter for Mode 1 conflict markers: 1/lineage, 2/logical, 3/schema, 4/bookmark, 5.1/subset, 5.2/empty, 5.3/addition, 6/all.",
     )
     parser.add_argument(
         "--type",
@@ -2116,7 +2166,7 @@ def main() -> None:
             run_mode_5_detailed_conflict_review(target_files, args.dry_run, auto_keep_m5, stats)
             print("\n--- Summary ---")
             print(f"Files scanned: {stats.files_scanned} | Modified: {stats.files_modified}")
-            print(f"Conflict markers found: {stats.conflicts_found} | Resolved: {stats.conflicts_resolved} | Skipped: {stats.conflicts_skipped}")
+            print(f"Conflict markers found: {stats.conflicts_found} | Resolved: {stats.resolved} | Skipped: {stats.conflicts_skipped}")
 
         # Sub-menu navigation return prompt
         print("\n" + CLR_CYAN + "--------------------------------------------------------------------------------" + CLR_RESET)
