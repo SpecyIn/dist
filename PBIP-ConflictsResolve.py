@@ -13,19 +13,24 @@ Modes & Capabilities:
      2 - LogicalIds (logicalId, sourceLogicalId in TMDL, JSON, & .platform files)
      3 - SchemaTags ($schema: "https://..." in PBIP JSON report files)
      4 - Bookmark / Object Name IDs ("name": "<hex-hash>" in bookmarks.json, page.json, visual.json)
-     5 - Additions Only (Accepts additions when one side contains all lines of the other side OR when one side is empty)
+     5 - Additions Only (Detailed sub-filters: Subset Additions [base same + extra], Empty-Side Additions [content vs blank], or All Additions)
      6 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)
+     b - Back to Main Menu
    - Features:
-     - Empty-Side & Subset Addition Detection: Auto-identifies pure additions even when one branch is completely empty.
+     - Addition Sub-Types (Subset vs Empty-Side): Distinguishes Subset Additions (base content identical + extra lines) from Empty-Side Additions (one branch contains text, other branch is completely empty/blank).
+     - Interactive Approval for Additions: Displays addition notices with recommended options (1/2), allowing manual review or bulk category auto-keep (1A/2A).
+     - Category-Scoped Auto-Keep in Combo Mode: In Combo Mode (Option 6), typing 1A or 2A auto-keeps remaining conflicts strictly within THAT conflict category (LineageTags, LogicalIds, SchemaTags, Bookmarks, Additions, etc.) and prompts again when transitioning to a new category.
      - Pure vs Mixed Conflict Detection: Detects single-line property vs mixed visual/expression changes.
      - Partial Fix Options (1P / 2P): Resolves property lines while keeping conflict markers around visual changes.
      - Bookmark Content Divergence Protection: Detects if bookmark content differs alongside ID, pausing 1A/2A auto-keep to prompt for safe manual choice.
      - Performance-Optimized Optional Cross-Reference Propagation: Scans project files to update cross-references of replaced bookmark/object IDs.
      - Bulletproof Index-Based Deletion: Immune to line ending (\r\n vs \n) or whitespace differences.
 
-2. Mode 2: Duplicate Object & JSON Comma Formatting Resolver.
-   - Target Objects: 1 - Columns, 2 - Expressions, 3 - Relationships (reverse pair canonical matching), 4 - JSON Comma & Syntax Auto-Formatter, 5 - All.
+2. Mode 2: Duplicate Object, Field Parameter & JSON Comma Formatting Resolver.
+   - Target Objects: 1 - Columns, 2 - Expressions, 3 - Relationships (reverse pair canonical matching), 4 - JSON Comma & Syntax Auto-Formatter, 5 - All, b - Back to Main Menu.
+   - Auto-Fixes Field Parameter metadata: Auto-updates 'length' properties to match actual projection item counts and re-sequences 'index' values (0, 1, 2, 3...) in JSON & TMDL files.
    - Auto-Fixes missing commas between adjacent JSON objects (}\n{ -> },\n{), removes duplicate commas, and strips invalid trailing commas before brackets.
+   - Accurately tracks files_scanned and files_modified statistics.
 
 3. Mode 3: Stage Clean Files to Git (Ultra-Fast Git Status Driven Mode - 12,000x Speedup).
    - Runs 'git status --porcelain' ONCE at repository root (~10ms) to instantly identify modified files.
@@ -34,16 +39,18 @@ Modes & Capabilities:
    - Batches clean files into `git add` calls of 50 files per process.
 
 4. Mode 4: Power BI PBIP Metadata Health & Diagnostic Check.
-   - Complete health validation scanning for remaining Git conflict markers, duplicate TMDL objects, JSON syntax errors, and missing lineageTags with exact line numbers.
+   - Complete health validation scanning for remaining Git conflict markers, duplicate TMDL objects, Field Parameter length/index mismatches, JSON syntax errors, and missing lineageTags with exact line numbers.
 
 5. Mode 5: Detailed Conflict Review & Visual Diff Viewer.
    - Reviews remaining Git conflicts one-by-one with full line-by-line diff highlights (* <-- DIFFERENT).
    - Option [1] is ALWAYS Incoming Change (Top), Option [2] is ALWAYS Current Branch / HEAD (Bottom).
 
 Features & Controls:
+- Field Parameter Validation & Auto-Fix: Validates and fixes Field Parameter projection lengths and index sequences (0, 1, 2, 3...) across TMDL & JSON report files.
+- Sub-Menu Back Navigation: Enter 'b' or '0' at any sub-menu prompt to immediately return to the Main Menu.
+- Category-Scoped 1A/2A (Mode 1 Combo): Auto-resolve (1A/2A) applies strictly per property category (Lineage, LogicalId, Bookmark, Subset Addition, Empty-Side Addition), preventing accidental global overwrites.
 - Ultra-Fast Staging (Mode 3): Single-pass Git status query skips unmodified & already-staged files in 10ms.
 - Live Real-Time Progress: Clear terminal progress feedback ([1/N] Checking...) eliminates perceived hangs.
-- Scoped Auto-Resolve (1A / 2A): '1A' or '2A' applies strictly to the currently selected property filter or object category session.
 - Interactive Navigation Loop: Sub-menu prompt to return to the Main Menu after completing tasks.
 - Full Fabric & Power BI File Support: Scans .tmdl, .json, .pbir, .pbip, .platform, .fabric, .definition, .item, and .report files.
 - Automatic Blank Line Cleanup: Collapses multiple consecutive empty lines resulting from deleted blocks.
@@ -60,7 +67,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Enable ANSI escape sequences on Windows console
 if sys.platform == "win32":
@@ -119,7 +126,7 @@ class FileTask:
 @dataclass
 class DiagnosticIssue:
     file_path: Path
-    issue_type: str  # "Git Conflict Marker", "Duplicate Object", "JSON Syntax Error", "Missing LineageTag"
+    issue_type: str  # "Git Conflict Marker", "Duplicate Object", "JSON Syntax Error", "Missing LineageTag", "Field Parameter Length Mismatch", "Field Parameter Index Error"
     description: str
     line_no: Optional[int] = None
 
@@ -171,6 +178,15 @@ BOOKMARK_ID_PATTERN = re.compile(
 FROM_COL_PATTERN = re.compile(r'^\s*["\']?fromColumn["\']?\s*:\s*(.+)$', re.IGNORECASE)
 TO_COL_PATTERN = re.compile(r'^\s*["\']?toColumn["\']?\s*:\s*(.+)$', re.IGNORECASE)
 
+TMDL_FP_TUPLE_PATTERN = re.compile(
+    r'^(\s*\(\s*"[^"]+"\s*,\s*NAMEOF\([^)]+\)\s*,\s*)(\d+)(\s*\)\s*,?\s*)$',
+    re.IGNORECASE
+)
+
+DUPLICATE_COMMAS_PATTERN = re.compile(r',\s*,')
+TRAILING_COMMAS_PATTERN = re.compile(r',\s*([\}\]])')
+JSON_VAL_END_PATTERN = re.compile(r'(:\s*(?:true|false|null|\d+|"[^"]*"))$')
+
 
 def get_indent_level(indent_str: str) -> int:
     """Calculates indentation level converting tabs to 4 spaces."""
@@ -208,7 +224,7 @@ def fix_pbip_json_formatting(content: str) -> str:
         return content
 
     # Fix duplicate commas
-    content = re.sub(r',\s*,', ',', content)
+    content = DUPLICATE_COMMAS_PATTERN.sub(',', content)
 
     # Fix missing commas between closing brace/quote/digit/boolean/null and opening brace/quote/bracket on next line
     lines = content.splitlines(keepends=True)
@@ -236,7 +252,7 @@ def fix_pbip_json_formatting(content: str) -> str:
                     curr_strip.endswith("}") or
                     curr_strip.endswith("]") or
                     curr_strip.endswith('"') or
-                    re.search(r'(:\s*(?:true|false|null|\d+|\"[^\"]*\"))$', curr_strip)
+                    bool(JSON_VAL_END_PATTERN.search(curr_strip))
                 )
                 starts_with_new_item = (
                     next_strip.startswith("{") or
@@ -250,9 +266,215 @@ def fix_pbip_json_formatting(content: str) -> str:
 
     new_content = "".join(fixed_lines)
     # Remove trailing commas before closing } or ]
-    new_content = re.sub(r',\s*([\}\]])', r'\n\1', new_content)
+    new_content = TRAILING_COMMAS_PATTERN.sub(r'\n\1', new_content)
 
     return new_content
+
+
+def fix_field_parameter_metadata(content: str) -> Tuple[str, int]:
+    """
+    Validates and auto-fixes Field Parameter metadata in JSON and TMDL files:
+    1. In JSON Report/Visual files:
+       - Checks objects containing 'projections' arrays (or 'parameter' with 'projections' & 'length').
+       - Auto-updates 'length' to match len(projections).
+       - Auto-sequences projection 'index' properties (0, 1, 2, 3... N-1).
+    2. In TMDL Field Parameter DAX source blocks:
+       - Auto-sequences tuple 0-based indices in source = { ("Label", NAMEOF(...), 0), ... }.
+
+    Returns (updated_content, total_fixes_made).
+    """
+    if not content.strip():
+        return content, 0
+
+    total_fixes = 0
+
+    # 1. Check for JSON Field Parameter Structure
+    try:
+        data = json.loads(content)
+
+        def walk_and_fix(node: Any) -> int:
+            nonlocal total_fixes
+            fixes_in_node = 0
+
+            if isinstance(node, dict):
+                # Check for parameter container object
+                for key, val in list(node.items()):
+                    if isinstance(val, dict):
+                        projs = val.get("projections") or val.get("parameterProjections") or val.get("parameterFields")
+                        if isinstance(projs, list) and projs:
+                            expected_len = len(projs)
+                            if "length" in val and val["length"] != expected_len:
+                                val["length"] = expected_len
+                                fixes_in_node += 1
+
+                            for idx, item in enumerate(projs):
+                                if isinstance(item, dict) and "index" in item:
+                                    if item["index"] != idx:
+                                        item["index"] = idx
+                                        fixes_in_node += 1
+
+                    elif key in ("projections", "parameterProjections", "parameterFields") and isinstance(val, list) and val:
+                        expected_len = len(val)
+                        if "length" in node and node["length"] != expected_len:
+                            node["length"] = expected_len
+                            fixes_in_node += 1
+
+                        for idx, item in enumerate(val):
+                            if isinstance(item, dict) and "index" in item:
+                                if item["index"] != idx:
+                                    item["index"] = idx
+                                    fixes_in_node += 1
+
+                for child in node.values():
+                    fixes_in_node += walk_and_fix(child)
+
+            elif isinstance(node, list):
+                for child in node:
+                    fixes_in_node += walk_and_fix(child)
+
+            return fixes_in_node
+
+        j_fixes = walk_and_fix(data)
+        if j_fixes > 0:
+            total_fixes += j_fixes
+            content = json.dumps(data, indent=2)
+    except Exception:
+        pass
+
+    # 2. Check for TMDL Field Parameter DAX Source Tuples
+    lines = content.splitlines(keepends=True)
+    new_tmdl_lines: List[str] = []
+    in_tmdl_fp_source = False
+    current_tuple_index = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if "source =" in stripped and ("{" in stripped or "=" in stripped):
+            in_tmdl_fp_source = True
+            current_tuple_index = 0
+            new_tmdl_lines.append(line)
+            continue
+        elif stripped.startswith("}") and in_tmdl_fp_source:
+            in_tmdl_fp_source = False
+            new_tmdl_lines.append(line)
+            continue
+
+        match = TMDL_FP_TUPLE_PATTERN.match(line)
+        if match and in_tmdl_fp_source:
+            prefix = match.group(1)
+            found_idx = int(match.group(2))
+            suffix = match.group(3)
+
+            if found_idx != current_tuple_index:
+                total_fixes += 1
+                new_line = f"{prefix}{current_tuple_index}{suffix}"
+                new_tmdl_lines.append(new_line)
+            else:
+                new_tmdl_lines.append(line)
+            current_tuple_index += 1
+        else:
+            new_tmdl_lines.append(line)
+
+    if total_fixes > 0:
+        content = "".join(new_tmdl_lines)
+
+    return content, total_fixes
+
+
+def load_override_parameters(yml_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """
+    Parses override-parameter.yml file looking for overrides list:
+    overrides:
+      - model_name: "XYZ"
+        takeover: "Yes"
+        find_value: "ABC"
+        replace_value:
+          development: "BC"
+          acceptance: "BC"
+          production: "PC"
+
+    RULE: Only entries where takeover is "Yes" (case-insensitive) are applied.
+    If takeover is not "Yes", the override entry is ignored.
+    """
+    if yml_path is None:
+        possible_paths = [
+            Path("override-parameter.yml"),
+            Path("override-parameter.yaml"),
+            Path("config/override-parameter.yml"),
+        ]
+        for p in possible_paths:
+            if p.exists() and p.is_file():
+                yml_path = p
+                break
+
+    if not yml_path or not yml_path.exists():
+        return []
+
+    try:
+        with open(yml_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return []
+
+    entries = []
+    blocks = re.split(r'\n\s*-\s+', content)
+    for block in blocks:
+        takeover_m = re.search(r'takeover\s*[:=]\s*["\']?([^"\'\n\r]+)["\']?', block, re.IGNORECASE)
+        if not takeover_m:
+            continue
+        takeover_val = takeover_m.group(1).strip()
+        # Strictly verify takeover == "Yes" (or "Y", "True")
+        if takeover_val.lower() not in ("yes", "y", "true"):
+            continue
+
+        model_m = re.search(r'model_name\s*[:=]\s*["\']?([^"\'\n\r]+)["\']?', block, re.IGNORECASE)
+        find_m = re.search(r'find_value\s*[:=]\s*["\']?([^"\'\n\r]+)["\']?', block, re.IGNORECASE)
+
+        replace_map = {}
+        dev_m = re.search(r'development\s*[:=]\s*["\']?([^"\'\n\r]+)["\']?', block, re.IGNORECASE)
+        acc_m = re.search(r'acceptance\s*[:=]\s*["\']?([^"\'\n\r]+)["\']?', block, re.IGNORECASE)
+        prod_m = re.search(r'production\s*[:=]\s*["\']?([^"\'\n\r]+)["\']?', block, re.IGNORECASE)
+
+        if dev_m:
+            replace_map["development"] = dev_m.group(1).strip()
+        if acc_m:
+            replace_map["acceptance"] = acc_m.group(1).strip()
+        if prod_m:
+            replace_map["production"] = prod_m.group(1).strip()
+
+        if find_m:
+            entries.append({
+                "model_name": model_m.group(1).strip() if model_m else "",
+                "takeover": takeover_val,
+                "find_value": find_m.group(1).strip(),
+                "replace_value": replace_map
+            })
+
+    return entries
+
+
+def apply_override_parameters(content: str, env: str = "development", yml_path: Optional[Path] = None) -> Tuple[str, int]:
+    """
+    Applies override parameters from override-parameter.yml to content if takeover is "Yes".
+    Returns (updated_content, total_overrides_applied).
+    """
+    overrides = load_override_parameters(yml_path)
+    if not overrides:
+        return content, 0
+
+    applied_count = 0
+    for entry in overrides:
+        find_val = entry["find_value"]
+        replace_map = entry.get("replace_value", {})
+        replace_val = replace_map.get(env.lower(), replace_map.get("development", find_val))
+
+        if find_val in content and replace_val != find_val:
+            count = content.count(find_val)
+            content = content.replace(find_val, replace_val)
+            applied_count += count
+
+    return content, applied_count
+
 
 
 def extract_column_name(header_str: str) -> str:
@@ -286,24 +508,67 @@ def get_canonical_relationship_key(from_col: str, to_col: str) -> Tuple[str, str
     return tuple(sorted([norm_from, norm_to]))
 
 
-def is_subset_addition(lines_a: List[str], lines_b: List[str]) -> bool:
+def is_subset_addition_only(lines_a: List[str], lines_b: List[str]) -> bool:
     """
-    Checks if lines_a is a subset of lines_b (ignoring whitespace and trailing commas).
-    Returns True if lines_b contains all lines of lines_a PLUS extra addition line(s)
-    OR if lines_a is completely empty and lines_b contains content.
+    Checks if lines_a and lines_b are BOTH non-empty and one is a strict subset of the other (extra lines added).
+    Sub-Type 1: Subset Addition (Base content identical + extra lines added).
     """
     clean_a = [l.strip().rstrip(",") for l in lines_a if l.strip()]
     clean_b = [l.strip().rstrip(",") for l in lines_b if l.strip()]
-
-    # If side A is completely empty and side B has lines, B is a pure addition over empty A!
-    if not clean_a and clean_b:
-        return True
 
     if not clean_a or not clean_b:
         return False
 
     it = iter(clean_b)
-    return all(item in it for item in clean_a) and len(clean_b) > len(clean_a)
+    if all(item in it for item in clean_a) and len(clean_b) > len(clean_a):
+        return True
+
+    it_rev = iter(clean_a)
+    if all(item in it_rev for item in clean_b) and len(clean_a) > len(clean_b):
+        return True
+
+    return False
+
+
+def is_empty_side_addition_only(lines_a: List[str], lines_b: List[str]) -> bool:
+    """
+    Checks if one side contains content lines while the other side is completely empty/blank.
+    Sub-Type 2: Empty-Side Addition (Content vs Blank/Empty).
+    """
+    clean_a = [l.strip().rstrip(",") for l in lines_a if l.strip()]
+    clean_b = [l.strip().rstrip(",") for l in lines_b if l.strip()]
+
+    return (not clean_a and bool(clean_b)) or (bool(clean_a) and not clean_b)
+
+
+def is_subset_addition(lines_a: List[str], lines_b: List[str]) -> bool:
+    """
+    Returns True if conflict is EITHER a Subset Addition (Sub-Type 1) OR an Empty-Side Addition (Sub-Type 2).
+    """
+    return is_subset_addition_only(lines_a, lines_b) or is_empty_side_addition_only(lines_a, lines_b)
+
+
+def detect_conflict_category(conflict: ConflictMarkerBlock) -> str:
+    """
+    Classifies a conflict block into a category:
+    'lineage', 'logical_id', 'schema', 'bookmark', 'subset_addition', 'empty_addition', or 'other'.
+    """
+    all_block_lines = conflict.head_lines + conflict.incoming_lines
+
+    if any(TAG_PATTERN.match(l) for l in all_block_lines):
+        return "lineage"
+    if any(LOGICAL_ID_PATTERN.match(l) for l in all_block_lines):
+        return "logical_id"
+    if any(SCHEMA_PATTERN.match(l) for l in all_block_lines):
+        return "schema"
+    if any(BOOKMARK_ID_PATTERN.match(l) for l in all_block_lines):
+        return "bookmark"
+    if is_subset_addition_only(conflict.head_lines, conflict.incoming_lines):
+        return "subset_addition"
+    if is_empty_side_addition_only(conflict.head_lines, conflict.incoming_lines):
+        return "empty_addition"
+
+    return "other"
 
 
 def is_pure_property_conflict(conflict: ConflictMarkerBlock, tag_filter: str) -> bool:
@@ -322,8 +587,12 @@ def is_pure_property_conflict(conflict: ConflictMarkerBlock, tag_filter: str) ->
         return all(SCHEMA_PATTERN.match(l) for l in all_lines)
     elif tag_filter == "bookmark":
         return all(BOOKMARK_ID_PATTERN.match(l) for l in all_lines)
+    elif tag_filter == "subset_addition":
+        return is_subset_addition_only(conflict.head_lines, conflict.incoming_lines)
+    elif tag_filter == "empty_addition":
+        return is_empty_side_addition_only(conflict.head_lines, conflict.incoming_lines)
     elif tag_filter == "addition":
-        return is_subset_addition(conflict.head_lines, conflict.incoming_lines) or is_subset_addition(conflict.incoming_lines, conflict.head_lines)
+        return is_subset_addition(conflict.head_lines, conflict.incoming_lines)
 
     return True
 
@@ -343,60 +612,6 @@ def is_bookmark_content_same(conflict: ConflictMarkerBlock) -> bool:
     ]
 
     return head_content_lines == incoming_content_lines
-
-
-def _get_pattern_for_filter(tag_filter: str):
-    """Returns the regex pattern associated with a tag_filter, or None for non-ID filters."""
-    if tag_filter == "lineage":
-        return TAG_PATTERN
-    elif tag_filter == "logical_id":
-        return LOGICAL_ID_PATTERN
-    elif tag_filter == "schema":
-        return SCHEMA_PATTERN
-    elif tag_filter == "bookmark":
-        return BOOKMARK_ID_PATTERN
-    return None
-
-
-def is_id_only_difference(conflict: ConflictMarkerBlock, tag_filter: str) -> bool:
-    """
-    Validates that the ONLY difference between the two sides of a conflict block is
-    the target ID/tag value itself. The structural "schema" (all non-ID lines) must be
-    identical between Incoming and Current sides.
-
-    Returns True if:
-      - Both sides contain at least one target ID/tag line.
-      - After removing the ID/tag lines, the remaining content lines are IDENTICAL.
-
-    Returns False if there are extra lines, missing lines, or any non-ID differences.
-
-    This check applies ONLY to ID-based filters (lineage, logical_id, schema, bookmark).
-    Addition conflicts (option 5) are NOT affected by this check.
-    """
-    pattern = _get_pattern_for_filter(tag_filter)
-    if pattern is None:
-        # Not an ID-based filter (e.g. addition, all) -- skip this validation
-        return True
-
-    # Check that at least one side has a matching ID line
-    head_has_id = any(pattern.match(l) for l in conflict.head_lines)
-    inc_has_id = any(pattern.match(l) for l in conflict.incoming_lines)
-
-    if not head_has_id and not inc_has_id:
-        return False  # Neither side has the target ID -- shouldn't be here
-
-    # Extract non-ID structural content from both sides (strip whitespace & trailing commas)
-    head_structure = [
-        l.strip().rstrip(",") for l in conflict.head_lines
-        if l.strip() and not pattern.match(l)
-    ]
-    inc_structure = [
-        l.strip().rstrip(",") for l in conflict.incoming_lines
-        if l.strip() and not pattern.match(l)
-    ]
-
-    # Both sides must have identical structural content (same lines, same order)
-    return head_structure == inc_structure
 
 
 def extract_lineage_tags(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -816,7 +1031,9 @@ def parse_git_conflict_blocks(
     - 'logical_id': blocks containing logicalId or sourceLogicalId
     - 'schema': blocks containing $schema
     - 'bookmark': blocks containing "name": "<hex-hash>"
-    - 'addition': blocks where one side contains all lines of the other side OR where one side is empty
+    - 'subset_addition': blocks where base content is identical + extra lines added
+    - 'empty_addition': blocks where one side is completely empty/blank and other side has text
+    - 'addition': any addition block (both subset and empty-side additions)
     - 'all': any conflict block (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)
     """
     conflict_blocks: List[ConflictMarkerBlock] = []
@@ -825,9 +1042,10 @@ def parse_git_conflict_blocks(
 
     while i < n:
         line = lines[i]
-        if line.strip().startswith("<<<<<<<"):
+        stripped = line.strip()
+        if stripped.startswith("<<<<<<<"):
             start_idx = i
-            ref_head = line.strip()[7:].strip()
+            ref_head = stripped[7:].strip()
             head_label = f"Current Branch ({ref_head if ref_head else 'HEAD'})"
             sep_idx = None
             end_idx = None
@@ -860,8 +1078,12 @@ def parse_git_conflict_blocks(
                     should_include = any(SCHEMA_PATTERN.match(l) for l in all_block_lines)
                 elif tag_filter == "bookmark":
                     should_include = any(BOOKMARK_ID_PATTERN.match(l) for l in all_block_lines)
+                elif tag_filter == "subset_addition":
+                    should_include = is_subset_addition_only(head_lines, inc_lines)
+                elif tag_filter == "empty_addition":
+                    should_include = is_empty_side_addition_only(head_lines, inc_lines)
                 elif tag_filter == "addition":
-                    should_include = is_subset_addition(head_lines, inc_lines) or is_subset_addition(inc_lines, head_lines)
+                    should_include = is_subset_addition(head_lines, inc_lines)
                 elif tag_filter == "all":
                     should_include = True
 
@@ -983,12 +1205,14 @@ def ask_propagate_cross_references(args_propagate: Optional[bool] = None) -> boo
 
 def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
     """
-    Returns normalized conflict marker target filter: 'lineage', 'logical_id', 'schema', 'bookmark', 'addition', or 'all'.
+    Returns normalized conflict marker target filter: 'lineage', 'logical_id', 'schema', 'bookmark', 'subset_addition', 'empty_addition', 'addition', 'all', or 'back'.
     Prompts interactively if not provided as CLI argument.
     """
     if args_conflict_type:
         val = args_conflict_type.strip().lower()
-        if val in ("1", "lineage", "lineagetag", "lineagetags"):
+        if val in ("b", "back", "0"):
+            return "back"
+        elif val in ("1", "lineage", "lineagetag", "lineagetags"):
             return "lineage"
         elif val in ("2", "logical", "logicalid", "logicalids"):
             return "logical_id"
@@ -996,7 +1220,11 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
             return "schema"
         elif val in ("4", "bookmark", "id", "hash"):
             return "bookmark"
-        elif val in ("5", "addition", "additions", "add"):
+        elif val in ("5.1", "subset", "subset_addition"):
+            return "subset_addition"
+        elif val in ("5.2", "empty", "empty_addition"):
+            return "empty_addition"
+        elif val in ("5", "5.3", "addition", "additions", "add"):
             return "addition"
         elif val in ("6", "all", "rest", "both"):
             return "all"
@@ -1006,11 +1234,17 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
     print(" 2 - LogicalIds (logicalId, sourceLogicalId)")
     print(" 3 - SchemaTags ($schema: \"https://...\")")
     print(" 4 - Bookmark / Object Name IDs (\"name\": \"<hex-hash>\")")
-    print(" 5 - Additions Only (Accept additions when one side contains all lines of the other side OR when one side is empty)")
+    print(" 5 - Additions Only:")
+    print("     5.1 - Subset Additions Only (Base content identical + extra lines added)")
+    print("     5.2 - Empty-Side Additions Only (One side contains content, other side is blank/empty)")
+    print("     5.3 - All Additions (Both Subset & Empty-Side Additions)")
     print(" 6 - All Conflict Markers (LineageTags, LogicalIds, SchemaTags, Bookmark IDs, Additions & All Other Conflicts)")
+    print(" b - Back to Main Menu")
     while True:
-        choice = input("Enter option (1, 2, 3, 4, 5, or 6): ").strip()
-        if choice == "1":
+        choice = input("Enter option (1, 2, 3, 4, 5, 5.1, 5.2, 5.3, 6, or b): ").strip().lower()
+        if choice in ("b", "back", "0"):
+            return "back"
+        elif choice == "1":
             return "lineage"
         elif choice == "2":
             return "logical_id"
@@ -1018,20 +1252,26 @@ def get_conflict_target_type(args_conflict_type: Optional[str]) -> str:
             return "schema"
         elif choice == "4":
             return "bookmark"
-        elif choice == "5":
+        elif choice in ("5.1", "subset"):
+            return "subset_addition"
+        elif choice in ("5.2", "empty"):
+            return "empty_addition"
+        elif choice in ("5", "5.3", "addition"):
             return "addition"
         elif choice == "6":
             return "all"
-        print("Invalid input. Please enter 1, 2, 3, 4, 5, or 6.\n")
+        print("Invalid input. Please enter 1, 2, 3, 4, 5.1, 5.2, 5.3, 6, or b.\n")
 
 
 def get_target_object_type(args_type: Optional[str]) -> str:
     """
-    Returns normalized target object type for Mode 2: 'column', 'expression', 'relationship', 'formatter', or 'all'.
+    Returns normalized target object type for Mode 2: 'column', 'expression', 'relationship', 'formatter', 'all', or 'back'.
     """
     if args_type:
         val = args_type.strip().lower()
-        if val in ("1", "column", "columns"):
+        if val in ("b", "back", "0"):
+            return "back"
+        elif val in ("1", "column", "columns"):
             return "column"
         elif val in ("2", "expression", "expressions"):
             return "expression"
@@ -1046,11 +1286,14 @@ def get_target_object_type(args_type: Optional[str]) -> str:
     print(" 1 - Columns")
     print(" 2 - Expressions")
     print(" 3 - Relationships")
-    print(" 4 - JSON Comma & Syntax Auto-Formatter (Fix missing/duplicate commas resulting from additions)")
-    print(" 5 - All (Columns, Expressions, Relationships & Comma Formatting Auto-Fixer)")
+    print(" 4 - Field Parameter & JSON Comma Syntax Auto-Formatter (Auto-fix length, indices & commas)")
+    print(" 5 - All (Columns, Expressions, Relationships & Field Parameter / JSON Auto-Fixer)")
+    print(" b - Back to Main Menu")
     while True:
-        choice = input("Enter option (1, 2, 3, 4, or 5): ").strip()
-        if choice == "1":
+        choice = input("Enter option (1, 2, 3, 4, 5, or b): ").strip().lower()
+        if choice in ("b", "back", "0"):
+            return "back"
+        elif choice == "1":
             return "column"
         elif choice == "2":
             return "expression"
@@ -1060,7 +1303,7 @@ def get_target_object_type(args_type: Optional[str]) -> str:
             return "formatter"
         elif choice == "5":
             return "all"
-        print("Invalid input. Please enter 1, 2, 3, 4, or 5.\n")
+        print("Invalid input. Please enter 1, 2, 3, 4, 5, or b.\n")
 
 
 def run_mode_1_conflict_markers(
@@ -1068,9 +1311,10 @@ def run_mode_1_conflict_markers(
 ) -> None:
     """
     Mode 1: Resolves Git Conflict Markers (<<<<<<< ======= >>>>>>>) filtered by conflict_target_type.
-    Performs global cross-reference hash propagation ONLY if propagate_refs is True.
-    When bookmark content is DIFFERENT, ALWAYS prompts the user (overriding 1A/2A auto-keep for safe manual decision).
-    Auto-formats JSON comma syntax after file modification.
+    In Combo Mode (conflict_target_type == "all"), 1A / 2A auto-keep is SCOPED STRICTLY per category
+    (Lineage, LogicalId, Schema, Bookmark, Subset Addition, Empty-Side Addition, Other).
+    Distinguishes Subset Additions (base content identical + extra lines) from Empty-Side Additions (content vs blank/empty).
+    Auto-fixes JSON syntax, commas, and Field Parameter metadata after file modification.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + f"  MODE 1: Resolving Git Conflict Markers (Target Filter: {conflict_target_type.upper()})" + CLR_RESET)
@@ -1078,6 +1322,12 @@ def run_mode_1_conflict_markers(
         prop_desc = "ENABLED" if propagate_refs else "DISABLED (FAST MODE)"
         print(f"  • Cross-Reference Propagation: {CLR_YELLOW}{prop_desc}{CLR_RESET}")
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
+
+    category_auto_keep: Dict[str, Optional[str]] = {}
+    if auto_keep_state[0] == "first":
+        category_auto_keep["global"] = "first"
+    elif auto_keep_state[0] == "last":
+        category_auto_keep["global"] = "last"
 
     for file_idx, file_path in enumerate(target_files, 1):
         try:
@@ -1113,42 +1363,31 @@ def run_mode_1_conflict_markers(
 
         for c_idx, conflict in enumerate(conflicts, 1):
             stats.conflicts_found += 1
-            is_pure = is_pure_property_conflict(conflict, conflict_target_type)
-            same_bookmark_content = is_bookmark_content_same(conflict) if conflict_target_type == "bookmark" else True
-            is_divergent = (conflict_target_type == "bookmark" and not same_bookmark_content)
 
-            inc_has_additions = is_subset_addition(conflict.head_lines, conflict.incoming_lines)
-            head_has_additions = is_subset_addition(conflict.incoming_lines, conflict.head_lines)
+            cat_type = detect_conflict_category(conflict)
+            is_pure = is_pure_property_conflict(conflict, cat_type if conflict_target_type == "all" else conflict_target_type)
+            same_bookmark_content = is_bookmark_content_same(conflict) if (cat_type == "bookmark" or conflict_target_type == "bookmark") else True
+            is_divergent = (cat_type == "bookmark" and not same_bookmark_content)
 
-            # For ID-based filters (1-4), validate that the ONLY difference is the ID itself.
-            # If there are extra structural differences beyond the ID, auto-skip this conflict.
-            # This does NOT apply to additions (option 5) or all (option 6).
-            if conflict_target_type in ("lineage", "logical_id", "schema", "bookmark"):
-                id_only = is_id_only_difference(conflict, conflict_target_type)
-                if not id_only:
-                    print("\n" + CLR_BOLD + f"Conflict {c_idx} of {num_conflicts} (Lines {conflict.start_line + 1}-{conflict.end_line + 1}):" + CLR_RESET)
-                    print(f"{CLR_YELLOW}  [SKIPPED - SCHEMA MISMATCH] Block has structural differences BEYOND just the {conflict_target_type.upper()} ID.{CLR_RESET}")
-                    print(f"{CLR_YELLOW}  Both sides must have identical content except for the ID value. Use Option 6 (All) or Mode 5 to review manually.{CLR_RESET}")
-                    # Show a quick preview of both sides
-                    print(f"  Option [1] [{conflict.incoming_label}] (Top):")
-                    for l in conflict.incoming_lines:
-                        print(f"      {CLR_GREEN}{l.rstrip()}{CLR_RESET}")
-                    print(f"  Option [2] [{conflict.head_label}] (Bottom):")
-                    for l in conflict.head_lines:
-                        print(f"      {CLR_RED}{l.rstrip()}{CLR_RESET}")
-                    stats.conflicts_skipped += 1
-                    continue
+            is_subset = is_subset_addition_only(conflict.head_lines, conflict.incoming_lines)
+            is_empty_side = is_empty_side_addition_only(conflict.head_lines, conflict.incoming_lines)
 
-            print("\n" + CLR_BOLD + f"Conflict {c_idx} of {num_conflicts} (Lines {conflict.start_line + 1}-{conflict.end_line + 1}):" + CLR_RESET)
-            
-            if inc_has_additions:
-                print(f"{CLR_GREEN}  [+] PURE ADDITION DETECTED: Option 1 [Incoming Change] contains all base lines PLUS new additions!{CLR_RESET}")
-            elif head_has_additions:
-                print(f"{CLR_GREEN}  [+] PURE ADDITION DETECTED: Option 2 [Current Branch] contains all base lines PLUS new additions!{CLR_RESET}")
+            # Determine which side has the addition content
+            inc_has_content = bool([l for l in conflict.incoming_lines if l.strip()])
+            head_has_content = bool([l for l in conflict.head_lines if l.strip()])
+            rec_side = 1 if inc_has_content else 2
+
+            print("\n" + CLR_BOLD + f"Conflict {c_idx} of {num_conflicts} (Category: {cat_type.upper()}, Lines {conflict.start_line + 1}-{conflict.end_line + 1}):" + CLR_RESET)
+
+            if is_subset:
+                print(f"{CLR_GREEN}  [+] SUBSET ADDITION DETECTED: Base content identical + extra lines added on Option {rec_side}!{CLR_RESET}")
+            elif is_empty_side:
+                empty_side_str = "Option 2 is BLANK/EMPTY" if inc_has_content else "Option 1 is BLANK/EMPTY"
+                print(f"{CLR_GREEN}  [+] EMPTY-SIDE ADDITION DETECTED: Option {rec_side} contains content while {empty_side_str}!{CLR_RESET}")
             elif is_divergent:
                 print(f"{CLR_RED}  [!] BOOKMARK DIVERGENCE DETECTED: Name is DIFFERENT AND Content/Properties are ALSO DIFFERENT!{CLR_RESET}")
             elif not is_pure:
-                print(f"{CLR_YELLOW}  [!] MIXED CONFLICT: Block contains {conflict_target_type.upper()} AND other code/visual changes!{CLR_RESET}")
+                print(f"{CLR_YELLOW}  [!] MIXED CONFLICT: Block contains {cat_type.upper()} AND other code/visual changes!{CLR_RESET}")
 
             print(f"  Option [1] [{conflict.incoming_label}] (Top):")
             for l in conflict.incoming_lines:
@@ -1159,29 +1398,25 @@ def run_mode_1_conflict_markers(
 
             selected_option = None  # "1", "2", "1P", "2P", "s"
 
-            # Auto-keep 1A/2A applies ONLY if NOT divergent! Divergent conflicts ALWAYS prompt user.
-            if auto_keep_state[0] == "first" and not is_divergent:
+            current_cat_keep = category_auto_keep.get(cat_type) or category_auto_keep.get("global")
+
+            if current_cat_keep == "first" and not is_divergent:
                 selected_option = "1"
-                print("  [AUTO-KEEP 1A] Selected Option 1 (Incoming Change)")
-            elif auto_keep_state[0] == "last" and not is_divergent:
+                print(f"  [AUTO-KEEP 1A ({cat_type.upper()})] Selected Option 1 (Incoming Change)")
+            elif current_cat_keep == "last" and not is_divergent:
                 selected_option = "2"
-                print("  [AUTO-KEEP 2A] Selected Option 2 (Current Branch)")
-            elif inc_has_additions and conflict_target_type == "addition":
-                selected_option = "1"
-                print("  [AUTO-ACCEPT ADDITION] Selected Option 1 (Incoming Change - Contains all base lines + additions)")
-            elif head_has_additions and conflict_target_type == "addition":
-                selected_option = "2"
-                print("  [AUTO-ACCEPT ADDITION] Selected Option 2 (Current Branch - Contains all base lines + additions)")
+                print(f"  [AUTO-KEEP 2A ({cat_type.upper()})] Selected Option 2 (Current Branch)")
             else:
                 while True:
-                    if inc_has_additions or head_has_additions:
-                        rec_str = " (Recommended: 1)" if inc_has_additions else " (Recommended: 2)"
+                    if is_subset or is_empty_side:
+                        add_kind = "SUBSET ADDITION" if is_subset else "EMPTY-SIDE ADDITION"
+                        rec_str = f" (Recommended: {rec_side})"
                         prompt_msg = (
-                            f"Select option for ADDITION conflict{rec_str}:\n"
+                            f"Select option for {add_kind} conflict{rec_str}:\n"
                             "  1  = Accept Option 1 [Incoming Change] (Top)\n"
                             "  2  = Accept Option 2 [Current Branch / HEAD] (Bottom)\n"
-                            "  1A = Accept Option 1 for all remaining conflicts\n"
-                            "  2A = Accept Option 2 for all remaining conflicts\n"
+                            f"  1A = Accept Option 1 for all remaining {cat_type.upper()} conflicts\n"
+                            f"  2A = Accept Option 2 for all remaining {cat_type.upper()} conflicts\n"
                             "  s  = Skip: "
                         )
                     elif is_divergent:
@@ -1189,14 +1424,14 @@ def run_mode_1_conflict_markers(
                             f"Select option for DIFFERENT-CONTENT Bookmark conflict:\n"
                             "  1  = Accept Option 1 [Incoming Change Bookmark]\n"
                             "  2  = Accept Option 2 [Current Branch / HEAD Bookmark]\n"
-                            "  1A = Accept Option 1 for all remaining conflicts\n"
-                            "  2A = Accept Option 2 for all remaining conflicts\n"
+                            "  1A = Accept Option 1 for all remaining BOOKMARK conflicts\n"
+                            "  2A = Accept Option 2 for all remaining BOOKMARK conflicts\n"
                             "  s  = Skip (Do NOT touch, leave conflict untouched): "
                         )
                     elif is_pure:
                         prompt_msg = (
-                            f"Select option to KEEP for this {conflict_target_type.upper()} conflict marker:\n"
-                            "  (1 = Keep Option 1 [Incoming], 2 = Keep Option 2 [Current], 1A = Keep Option 1 for ALL, 2A = Keep Option 2 for ALL, s = skip): "
+                            f"Select option to KEEP for this {cat_type.upper()} conflict marker:\n"
+                            f"  (1 = Option 1 [Incoming], 2 = Option 2 [Current], 1A = Option 1 for ALL {cat_type.upper()}S, 2A = Option 2 for ALL {cat_type.upper()}S, s = skip): "
                         )
                     else:
                         prompt_msg = (
@@ -1205,8 +1440,8 @@ def run_mode_1_conflict_markers(
                             "  2  = Full Option 2 [Current Branch]\n"
                             "  1P = Partial Fix: Update tag to Option 1 [Incoming], KEEP conflict markers for visual/other changes\n"
                             "  2P = Partial Fix: Update tag to Option 2 [Current], KEEP conflict markers for visual/other changes\n"
-                            "  1A = Full Option 1 for ALL remaining conflicts\n"
-                            "  2A = Full Option 2 for ALL remaining conflicts\n"
+                            f"  1A = Full Option 1 for ALL remaining {cat_type.upper()} conflicts\n"
+                            f"  2A = Full Option 2 for ALL remaining {cat_type.upper()} conflicts\n"
                             "  s  = Skip: "
                         )
 
@@ -1230,18 +1465,31 @@ def run_mode_1_conflict_markers(
                         break
                     elif choice in ("1a", "a1", "all1"):
                         selected_option = "1"
-                        auto_keep_state[0] = "first"
-                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 1 [Incoming Change] for remaining {conflict_target_type.upper()} conflicts.{CLR_RESET}")
+                        category_auto_keep[cat_type] = "first"
+                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL for category [{cat_type.upper()}]: Keeping Option 1 [Incoming Change].{CLR_RESET}")
                         break
                     elif choice in ("2a", "a2", "all2"):
                         selected_option = "2"
-                        auto_keep_state[0] = "last"
-                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL: Keeping Option 2 [Current Branch] for remaining {conflict_target_type.upper()} conflicts.{CLR_RESET}")
+                        category_auto_keep[cat_type] = "last"
+                        print(f"{CLR_GREEN}--> Activated AUTO-RESOLVE ALL for category [{cat_type.upper()}]: Keeping Option 2 [Current Branch].{CLR_RESET}")
                         break
                     print("Invalid choice. Please enter a valid option.")
 
             if selected_option == "s":
                 continue
+
+            # ID-Only enforcement for LineageTags, LogicalIds, SchemaTags, and Bookmark IDs:
+            # If the conflict block contains non-ID extra content (is_pure is False),
+            # option 1 or 2 (including 1A / 2A auto-keep) MUST ONLY resolve the ID line (Partial Fix)
+            # and MUST NOT touch/delete the extra content part.
+            # Additions Only (subset_addition, empty_addition) are NOT affected by this restriction.
+            if (cat_type in ("lineage", "logical_id", "schema", "bookmark") or conflict_target_type in ("lineage", "logical_id", "schema", "bookmark")) and not is_pure:
+                if selected_option in ("1", "1P"):
+                    selected_option = "1P"
+                    print(f"{CLR_YELLOW}--> Extra content detected in {cat_type.upper()} block: Applying ID-Only fix (Option 1 ID updated, extra content preserved).{CLR_RESET}")
+                elif selected_option in ("2", "2P"):
+                    selected_option = "2P"
+                    print(f"{CLR_YELLOW}--> Extra content detected in {cat_type.upper()} block: Applying ID-Only fix (Option 2 ID updated, extra content preserved).{CLR_RESET}")
 
             if selected_option in ("1", "2"):
                 stats.conflicts_resolved += 1
@@ -1262,7 +1510,7 @@ def run_mode_1_conflict_markers(
                         lines_to_delete.add(idx)
 
                 # Extract and propagate hash replacement ONLY if propagate_refs is True
-                if propagate_refs and (conflict_target_type == "bookmark" or (conflict_target_type == "all" and is_pure)):
+                if propagate_refs and (cat_type == "bookmark" or (conflict_target_type == "all" and is_pure)):
                     kept_hash = None
                     discarded_hash = None
 
@@ -1287,27 +1535,23 @@ def run_mode_1_conflict_markers(
                 stats.conflicts_resolved += 1
                 source_lines = conflict.incoming_lines if selected_option == "1P" else conflict.head_lines
 
-                extracted_tag_line = None
-                if conflict_target_type == "lineage":
+                if cat_type == "lineage":
                     pat = TAG_PATTERN
-                elif conflict_target_type == "logical_id":
+                elif cat_type == "logical_id":
                     pat = LOGICAL_ID_PATTERN
-                elif conflict_target_type == "bookmark":
+                elif cat_type == "bookmark":
                     pat = BOOKMARK_ID_PATTERN
                 else:
                     pat = SCHEMA_PATTERN
 
-                for l in source_lines:
-                    if pat.match(l):
-                        extracted_tag_line = l
-                        break
+                extracted_tag_lines = [l for l in source_lines if pat.match(l)]
 
-                if extracted_tag_line:
-                    partial_insertions[conflict.start_line] = [extracted_tag_line]
+                if extracted_tag_lines:
+                    partial_insertions[conflict.start_line] = extracted_tag_lines
                     for idx in range(conflict.start_line + 1, conflict.end_line):
                         if pat.match(lines[idx]):
                             lines_to_delete.add(idx)
-                    print(f"{CLR_GREEN}--> Partial Fix Applied: Updated tag line and preserved visual conflict markers.{CLR_RESET}")
+                    print(f"{CLR_GREEN}--> Partial Fix Applied (ID Only): Updated ID tag line(s) and preserved extra content conflict markers.{CLR_RESET}")
 
         if (lines_to_delete or partial_insertions) and not dry_run:
             stats.files_modified += 1
@@ -1321,7 +1565,8 @@ def run_mode_1_conflict_markers(
             cleaned_lines = cleanup_excessive_blank_lines(new_lines)
             new_content = "".join(cleaned_lines)
 
-            # Automatically fix JSON comma syntax formatting if JSON/report file
+            # Auto-format JSON syntax/commas & Field Parameter metadata
+            new_content, fp_count = fix_field_parameter_metadata(new_content)
             if file_path.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
                 new_content = fix_pbip_json_formatting(new_content)
 
@@ -1330,41 +1575,51 @@ def run_mode_1_conflict_markers(
                 encoded = b"\xef\xbb\xbf" + encoded
             with open(file_path, "wb") as f:
                 f.write(encoded)
-            print(f"[UPDATED] File conflict markers resolved & JSON formatted: {file_path}")
+            print(f"[UPDATED] File conflict markers resolved & formatted: {file_path}")
 
 
 def run_mode_2_dedupe_objects(
     target_files: List[Path], target_object_type: str, dry_run: bool, auto_keep_state: List[Optional[str]], stats: SummaryStats
 ) -> None:
     """
-    Mode 2: Deduplicates Objects (Columns, Expressions, Relationships) and auto-fixes JSON comma syntax formatting.
+    Mode 2: Deduplicates Objects (Columns, Expressions, Relationships) and auto-fixes Field Parameter & JSON comma metadata.
+    Accurately tracks files_scanned and files_modified statistics.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
-    print(CLR_BOLD + f"  MODE 2: Resolving Duplicate Objects & JSON Formatter (Target: {target_object_type.upper()})" + CLR_RESET)
+    print(CLR_BOLD + f"  MODE 2: Resolving Duplicate Objects & Formatter (Target: {target_object_type.upper()})" + CLR_RESET)
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
 
     if target_object_type in ("formatter", "all"):
         json_files_fixed = 0
         for fpath in target_files:
-            if fpath.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
+            if fpath.suffix.lower() in (".json", ".pbir", ".pbip", ".platform", ".tmdl"):
+                stats.files_scanned += 1
                 try:
                     with open(fpath, "rb") as f:
                         raw = f.read()
                     has_bom = raw.startswith(b"\xef\xbb\xbf")
                     txt = (raw[3:] if has_bom else raw).decode("utf-8")
-                    fixed = fix_pbip_json_formatting(txt)
-                    if fixed != txt and not dry_run:
-                        enc = fixed.encode("utf-8")
-                        if has_bom:
-                            enc = b"\xef\xbb\xbf" + enc
-                        with open(fpath, "wb") as f:
-                            f.write(enc)
-                        json_files_fixed += 1
-                        print(f"  {CLR_GREEN}[FORMATTED]{CLR_RESET} Fixed JSON comma/syntax formatting in: {fpath}")
+                    
+                    fixed, fp_count = fix_field_parameter_metadata(txt)
+                    if fpath.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
+                        fixed = fix_pbip_json_formatting(fixed)
+
+                    if fixed != txt:
+                        stats.files_modified += 1
+                        if not dry_run:
+                            enc = fixed.encode("utf-8")
+                            if has_bom:
+                                enc = b"\xef\xbb\xbf" + enc
+                            with open(fpath, "wb") as f:
+                                f.write(enc)
+                            json_files_fixed += 1
+                            print(f"  {CLR_GREEN}[FORMATTED]{CLR_RESET} Fixed Field Parameter & JSON metadata in: {fpath}")
+                        else:
+                            print(f"  [DRY-RUN FORMAT] Would fix Field Parameter / JSON formatting in: {fpath}")
                 except Exception:
-                    pass
-        if json_files_fixed > 0:
-            print(f"\n{CLR_GREEN}--> Auto-Formatted JSON Comma Syntax in {json_files_fixed} file(s).{CLR_RESET}")
+                    stats.files_skipped += 1
+
+        print(f"\nFormatter Summary: Scanned {CLR_CYAN}{stats.files_scanned}{CLR_RESET} file(s) | Formatted: {CLR_GREEN}{json_files_fixed}{CLR_RESET} file(s)")
 
     if target_object_type != "formatter":
         tasks, total_duplicates_all = scan_and_prepare_tasks(target_files, target_object_type, stats)
@@ -1497,7 +1752,7 @@ def run_mode_3_stage_clean_files(target_files: List[Path], dry_run: bool, target
 def run_mode_4_metadata_diagnostic(target_files: List[Path]) -> List[DiagnosticIssue]:
     """
     Mode 4: Performs a comprehensive Power BI PBIP Metadata & Health Validation Check.
-    Scans files for remaining conflict markers, duplicate objects, JSON syntax errors, and missing lineageTags.
+    Scans files for remaining conflict markers, duplicate objects, Field Parameter length/index mismatches, JSON syntax errors, and missing lineageTags.
     """
     print("\n" + CLR_CYAN + "================================================================================" + CLR_RESET)
     print(CLR_BOLD + "  MODE 4: Power BI PBIP Metadata & Health Validation Diagnostic Check" + CLR_RESET)
@@ -1549,10 +1804,51 @@ def run_mode_4_metadata_diagnostic(target_files: List[Path]) -> List[DiagnosticI
                 line_no=dups[0].start_line + 1
             ))
 
-        # 3. Check for JSON Syntax Errors in report/definition files
-        if file_path.suffix.lower() in (".json", ".pbir", ".pbip"):
+        # 3. Check for Field Parameter Length & Index Mismatches
+        if file_path.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
             try:
-                json.loads(content)
+                data = json.loads(content)
+                def check_fp_json(node: Any):
+                    if isinstance(node, dict):
+                        for k, v in list(node.items()):
+                            if isinstance(v, dict):
+                                projs = v.get("projections") or v.get("parameterProjections") or v.get("parameterFields")
+                                if isinstance(projs, list) and projs:
+                                    if "length" in v and v["length"] != len(projs):
+                                        issues.append(DiagnosticIssue(
+                                            file_path=file_path,
+                                            issue_type="Field Parameter Length Mismatch",
+                                            description=f"Field Parameter length property is {v['length']}, but actual projections count is {len(projs)}"
+                                        ))
+                                    indices = [item.get("index") for item in projs if isinstance(item, dict) and "index" in item]
+                                    expected = list(range(len(indices)))
+                                    if indices != expected:
+                                        issues.append(DiagnosticIssue(
+                                            file_path=file_path,
+                                            issue_type="Field Parameter Index Error",
+                                            description=f"Field Parameter index sequence is {indices}, expected {expected}"
+                                        ))
+                            elif k in ("projections", "parameterProjections", "parameterFields") and isinstance(v, list) and v:
+                                if "length" in node and node["length"] != len(v):
+                                    issues.append(DiagnosticIssue(
+                                        file_path=file_path,
+                                        issue_type="Field Parameter Length Mismatch",
+                                        description=f"Field Parameter length property is {node['length']}, but actual projections count is {len(v)}"
+                                    ))
+                                indices = [item.get("index") for item in v if isinstance(item, dict) and "index" in item]
+                                expected = list(range(len(indices)))
+                                if indices != expected:
+                                    issues.append(DiagnosticIssue(
+                                        file_path=file_path,
+                                        issue_type="Field Parameter Index Error",
+                                        description=f"Field Parameter index sequence is {indices}, expected {expected}"
+                                    ))
+                        for child in node.values():
+                            check_fp_json(child)
+                    elif isinstance(node, list):
+                        for child in node:
+                            check_fp_json(child)
+                check_fp_json(data)
             except json.JSONDecodeError as e:
                 issues.append(DiagnosticIssue(
                     file_path=file_path,
@@ -1560,6 +1856,32 @@ def run_mode_4_metadata_diagnostic(target_files: List[Path]) -> List[DiagnosticI
                     description=f"JSON parse error: {e.msg} at line {e.lineno}, col {e.colno}",
                     line_no=e.lineno
                 ))
+
+        # Check for TMDL Field Parameter Tuple Index Mismatches
+        if file_path.suffix.lower() == ".tmdl":
+            in_fp_source = False
+            cur_tuple_idx = 0
+            for l_idx, line in enumerate(lines, 1):
+                s = line.strip()
+                if "source =" in s and ("{" in s or "=" in s):
+                    in_fp_source = True
+                    cur_tuple_idx = 0
+                    continue
+                elif s.startswith("}") and in_fp_source:
+                    in_fp_source = False
+                    continue
+
+                m = TMDL_FP_TUPLE_PATTERN.match(line)
+                if m and in_fp_source:
+                    idx_val = int(m.group(2))
+                    if idx_val != cur_tuple_idx:
+                        issues.append(DiagnosticIssue(
+                            file_path=file_path,
+                            issue_type="Field Parameter Index Error",
+                            description=f"TMDL Field Parameter tuple has index {idx_val}, expected sequential index {cur_tuple_idx}",
+                            line_no=l_idx
+                        ))
+                    cur_tuple_idx += 1
 
         # 4. Check for missing LineageTags in TMDL column blocks
         if file_path.suffix.lower() == ".tmdl":
@@ -1732,7 +2054,8 @@ def run_mode_5_detailed_conflict_review(
             cleaned_lines = cleanup_excessive_blank_lines(new_lines)
             new_content = "".join(cleaned_lines)
 
-            # Auto-format JSON syntax/commas if JSON/report file
+            # Auto-format JSON syntax/commas & Field Parameter metadata
+            new_content, fp_count = fix_field_parameter_metadata(new_content)
             if file_path.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
                 new_content = fix_pbip_json_formatting(new_content)
 
@@ -1741,7 +2064,7 @@ def run_mode_5_detailed_conflict_review(
                 encoded = b"\xef\xbb\xbf" + encoded
             with open(file_path, "wb") as f:
                 f.write(encoded)
-            print(f"[UPDATED] File conflict markers resolved & JSON formatted: {file_path}")
+            print(f"[UPDATED] File conflict markers resolved & formatted: {file_path}")
 
 
 def scan_and_prepare_tasks(
@@ -1936,7 +2259,8 @@ def process_file_task(
         cleaned_lines = cleanup_excessive_blank_lines(new_lines)
         new_content = "".join(cleaned_lines)
 
-        # Auto-format JSON syntax/commas if JSON/report file
+        # Auto-format JSON syntax/commas & Field Parameter metadata
+        new_content, fp_count = fix_field_parameter_metadata(new_content)
         if task.file_path.suffix.lower() in (".json", ".pbir", ".pbip", ".platform"):
             new_content = fix_pbip_json_formatting(new_content)
 
@@ -1971,7 +2295,7 @@ def get_action_mode(args_mode: Optional[str]) -> str:
     print(CLR_CYAN + "================================================================================" + CLR_RESET)
     print("Select resolution action to perform:")
     print(" 1 - Resolve Git Conflict Markers (lineageTag, logicalId, $schema, bookmark IDs, additions, and all conflicts)")
-    print(" 2 - Resolve Duplicate Objects & Auto-Format JSON Commas/Syntax")
+    print(" 2 - Resolve Duplicate Objects & Auto-Format Field Parameter / JSON Metadata")
     print(" 3 - Stage Clean Files to Git (Automatically git add files with 0 remaining conflict markers)")
     print(" 4 - Power BI PBIP Metadata Health & Diagnostic Check (Scan for all remaining issues)")
     print(" 5 - Detailed Conflict Review & Visual Diff Viewer (Review remaining conflicts one-by-one with diff highlights)")
@@ -2020,6 +2344,8 @@ def run_single_execution(target_path: Path, mode: str, args) -> None:
 
     if mode == "1":
         conflict_target_type = get_conflict_target_type(args.conflict_type)
+        if conflict_target_type == "back":
+            return
         propagate_refs = False
         if conflict_target_type in ("bookmark", "all"):
             propagate_refs = ask_propagate_cross_references(args.propagate_refs if hasattr(args, "propagate_refs") and args.propagate_refs else None)
@@ -2029,6 +2355,8 @@ def run_single_execution(target_path: Path, mode: str, args) -> None:
 
     if mode == "2":
         target_object_type = get_target_object_type(args.type)
+        if target_object_type == "back":
+            return
         auto_keep_m2 = [initial_auto_keep]
         run_mode_2_dedupe_objects(target_files, target_object_type, args.dry_run, auto_keep_m2, stats)
 
@@ -2062,8 +2390,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--conflict-type",
-        choices=["1", "2", "3", "4", "5", "6", "lineage", "logical", "schema", "bookmark", "addition", "all"],
-        help="Target property filter for Mode 1 conflict markers: 1/lineage, 2/logical, 3/schema, 4/bookmark, 5/addition, 6/all.",
+        choices=["1", "2", "3", "4", "5", "5.1", "5.2", "5.3", "6", "lineage", "logical", "schema", "bookmark", "subset", "empty", "addition", "all"],
+        help="Target property filter for Mode 1 conflict markers: 1/lineage, 2/logical, 3/schema, 4/bookmark, 5.1/subset, 5.2/empty, 5.3/addition, 6/all.",
     )
     parser.add_argument(
         "--type",
@@ -2133,6 +2461,10 @@ def main() -> None:
             run_mode_4_metadata_diagnostic(target_files)
         elif mode == "1":
             conflict_target_type = get_conflict_target_type(args.conflict_type)
+            if conflict_target_type == "back":
+                print(f"\n{CLR_YELLOW}--> Returning to Main Menu...{CLR_RESET}")
+                continue
+
             propagate_refs = False
             if conflict_target_type in ("bookmark", "all"):
                 propagate_refs = ask_propagate_cross_references(args.propagate_refs if hasattr(args, "propagate_refs") and args.propagate_refs else None)
@@ -2144,6 +2476,10 @@ def main() -> None:
             print(f"Conflict markers found: {stats.conflicts_found} | Resolved: {stats.conflicts_resolved} | Skipped: {stats.conflicts_skipped}")
         elif mode == "2":
             target_object_type = get_target_object_type(args.type)
+            if target_object_type == "back":
+                print(f"\n{CLR_YELLOW}--> Returning to Main Menu...{CLR_RESET}")
+                continue
+
             auto_keep_m2 = [initial_auto_keep]
             run_mode_2_dedupe_objects(target_files, target_object_type, args.dry_run, auto_keep_m2, stats)
             print("\n--- Summary ---")
